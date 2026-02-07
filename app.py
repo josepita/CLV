@@ -3,6 +3,33 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import io
+import os
+import json
+
+# --- Configuración de persistencia de informes ---
+REPORTS_DIR = "reports"
+REPORTS_INDEX_FILE = os.path.join(REPORTS_DIR, "reports_index.json")
+
+def load_reports_index():
+    if not os.path.exists(REPORTS_DIR):
+        os.makedirs(REPORTS_DIR)
+    if os.path.exists(REPORTS_INDEX_FILE):
+        with open(REPORTS_INDEX_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {} # Retorna un diccionario vacío si no existe el índice
+
+def save_reports_index(index_data):
+    if not os.path.exists(REPORTS_DIR):
+        os.makedirs(REPORTS_DIR)
+    with open(REPORTS_INDEX_FILE, "w", encoding="utf-8") as f:
+        json.dump(index_data, f, indent=4)
+
+def get_report_filepath(report_name_base):
+    # Genera un nombre de archivo seguro y único para el Excel
+    # Reemplazamos caracteres no válidos para nombres de archivo con guiones bajos
+    safe_name = "".join(c if c.isalnum() else "_" for c in report_name_base).lower()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(REPORTS_DIR, f"{safe_name}_{timestamp}.xlsx")
 
 # --- Funciones de Cálculo de Informes (a implementar) ---
 
@@ -399,10 +426,19 @@ def filter_reports_by_date(reports, start_date, end_date):
         row_mask = (idx_period.dt.start_time >= start_ts) & (idx_period.dt.start_time <= end_ts)
         df_copy = df_copy.loc[row_mask]
         # Filtrar columnas (periodos calendario)
-        col_period = pd.Series(df_copy.columns, index=df_copy.columns).apply(lambda x: pd.Period(str(x).replace('Y',''), freq=freq))
-        col_keep = (col_period.dt.start_time >= start_ts) & (col_period.dt.start_time <= end_ts)
-        # Siempre mantener la primera columna de totales
-        col_keep.iloc[0] = True
+        # Inicializar col_keep con el mismo índice y longitud que df_copy.columns
+        col_keep = pd.Series(False, index=df_copy.columns)
+        # Siempre mantener la primera columna de totales (índice 0)
+        if not df_copy.columns.empty:
+            col_keep.iloc[0] = True
+
+        # Crear col_period solo para las columnas relevantes (a partir de la segunda)
+        if len(df_copy.columns) > 1:
+            col_period_names = df_copy.columns[1:]
+            col_period_series = pd.Series(col_period_names, index=col_period_names).apply(lambda x: pd.Period(str(x).replace('Y',''), freq=freq))
+            period_mask = (col_period_series.dt.start_time >= start_ts) & (col_period_series.dt.start_time <= end_ts)
+            col_keep[1:] = period_mask.values # Asignar los valores booleanos a las columnas correspondientes
+        
         df_copy = df_copy.loc[:, col_keep]
         return df_copy
 
@@ -499,6 +535,10 @@ st.markdown("Sube un archivo CSV de pedidos para generar informes de retención 
 
 if "history" not in st.session_state:
     st.session_state["history"] = []
+if "df_raw" not in st.session_state: # Inicializar df_raw también
+    st.session_state["df_raw"] = None
+if "selected_report" not in st.session_state: # Para almacenar el nombre del informe cargado/generado
+    st.session_state["selected_report"] = None
 
 preview_placeholder = st.empty()
 status_placeholder = st.empty()
@@ -542,30 +582,33 @@ if st.session_state["history"]:
         st.session_state["data_date_max"] = max(dates_available)
         st.session_state["view_date_range"] = (st.session_state["data_date_min"], st.session_state["data_date_max"])
 
-# Estado inicial para mostrar u ocultar el panel de carga
-if "show_controls" not in st.session_state:
-    st.session_state["show_controls"] = False if st.session_state.get("base_reports") else True
+# Opción principal: Generar nuevo o cargar existente
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Opciones Principales")
+mode = st.sidebar.radio(
+    "¿Qué deseas hacer?",
+    ("Generar un nuevo informe", "Ver informes guardados"),
+    index=0 if not st.session_state.get("base_reports") else 1, # Por defecto, si ya hay informe, ir a ver guardados
+    key="app_mode"
+)
 
-# Botón para mostrar panel cuando está oculto
-if not st.session_state["show_controls"]:
-    if st.button("Mostrar panel de carga y filtros"):
-        st.session_state["show_controls"] = True
+# Renderizar el contenido según el modo seleccionado
+if mode == "Generar un nuevo informe":
+    st.session_state["show_controls"] = True # Forzar la visualización del panel de carga en este modo
 
-# ---- Panel de carga y generación (ocultable) ----
-if st.session_state["show_controls"]:
+    # ---- Panel de carga y generación ----
+    # Ya no es ocultable por el botón, pero se mantiene la estructura para la carga de CSV
     with st.container():
         st.markdown("### Subir datos y generar informes")
-        uploaded_file = st.file_uploader("Elige un archivo CSV", type="csv", key="uploader_panel")
+        # Asegurarse de que uploaded_file se obtiene de un solo widget
+        uploaded_file = st.file_uploader("Elige un archivo CSV", type="csv", key="uploader_panel_main") 
 
-        if uploaded_file is not None:
-            df_raw = pd.read_csv(uploaded_file)
-            st.session_state["df_raw"] = df_raw
+        if uploaded_file is not None and uploaded_file.size > 0: # Añadir verificación de tamaño
+            st.session_state["df_raw"] = pd.read_csv(uploaded_file) # Guardar en session_state para persistencia
+            preview_placeholder.info("Archivo subido correctamente. Mostrando primeras 5 filas:")
+            preview_placeholder.dataframe(st.session_state["df_raw"].head())
 
-            with preview_placeholder.container():
-                st.info("Archivo subido correctamente. Mostrando primeras 5 filas:")
-                st.dataframe(df_raw.head())
-
-            fechas_preview = df_raw['fecha'].apply(convert_excel_date)
+            fechas_preview = st.session_state["df_raw"]['fecha'].apply(convert_excel_date)
             min_fecha = fechas_preview.min()
             max_fecha = fechas_preview.max()
             if pd.isna(min_fecha) or pd.isna(max_fecha):
@@ -585,11 +628,11 @@ if st.session_state["show_controls"]:
                 date_start = min_fecha.date()
                 date_end = max_fecha.date()
 
-            if st.button("Generar / Actualizar Informes"):
+            if st.button("Generar / Actualizar Informes", key="generate_button_main"):
                 log_box = status_placeholder.empty()
                 log = log_box.write
                 with st.spinner("Procesando datos y generando informes... Esto puede tardar unos minutos."):
-                    df_processed = preprocess_data(df_raw, logger=log)
+                    df_processed = preprocess_data(st.session_state["df_raw"].copy(), logger=log) # Usar df_raw del session_state
                     if df_processed is not None and not df_processed.empty:
                         start_ts = pd.Timestamp(date_start)
                         end_ts = pd.Timestamp(date_end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
@@ -609,135 +652,176 @@ if st.session_state["show_controls"]:
                             "report3": report3_df,
                             "report4": report4_dfs,
                         }
-                        excel_file = export_to_excel(all_reports)
+                        excel_file = export_to_excel(all_reports) # Se devuelve el io.BytesIO
+
+                        # --- Ahora se añade la opción de guardar el informe generado ---
+                        st.subheader("Guardar Informe Generado")
+                        report_name_input = st.text_input("Introduce un nombre para guardar este informe:", 
+                                                     value=f"Informe CLV {datetime.now().strftime('%Y%m%d_%H%M')}",
+                                                     key="save_report_name_input")
+                        
+                        if st.button("💾 Guardar Informe", key="save_report_button"):
+                            if report_name_input:
+                                reports_index = load_reports_index()
+                                if report_name_input in reports_index:
+                                    st.warning(f"Ya existe un informe con el nombre '{report_name_input}'. Por favor, elige otro nombre.")
+                                else:
+                                    report_filepath = get_report_filepath(report_name_input)
+                                    with open(report_filepath, "wb") as f:
+                                        f.write(excel_file.getvalue()) # Guardar los bytes del Excel en el archivo
+
+                                    reports_index[report_name_input] = {
+                                        "filename": os.path.basename(report_filepath),
+                                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                        "date_min": date_start.isoformat(),
+                                        "date_max": date_end.isoformat(),
+                                        "summary": report3_summary # Guardar el resumen también si es útil
+                                    }
+                                    save_reports_index(reports_index)
+                                    st.success(f"Informe '{report_name_input}' guardado exitosamente.")
+                                    st.session_state["save_report_name_input"] = f"Informe CLV {datetime.now().strftime('%Y%m%d_%H%M')}" # Resetear input
+                                    st.session_state["base_reports"] = all_reports # Cargar en la vista principal
+                                    st.session_state["base_summary"] = report3_summary
+                                    st.session_state["selected_report"] = report_name_input # Marcar como seleccionado
+                                    st.experimental_rerun() # Recargar para mostrar el informe
+                            else:
+                                st.warning("Por favor, introduce un nombre para el informe.")
+
                         st.session_state["history"].insert(0, {
                             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
                             "reports": all_reports,
                             "excel_bytes": excel_file.getvalue(),
                             "summary": report3_summary
                         })
-                        # Guardar como base para vista y rango por defecto
+                        # Guardar como base para vista y rango por defecto para la sesión
+                        # Si no se guarda persistentemente, sigue siendo visible en la sesión
                         st.session_state["base_reports"] = all_reports
                         st.session_state["base_summary"] = report3_summary
                         st.session_state["data_date_min"] = df_processed['fecha_dt'].min().date()
                         st.session_state["data_date_max"] = df_processed['fecha_dt'].max().date()
                         st.session_state["view_date_range"] = (st.session_state["data_date_min"], st.session_state["data_date_max"])
 
-                        # Limpiar vista previa y logs; ocultar panel
+                        # Limpiar vista previa y logs;
                         log_box.empty()
                         preview_placeholder.empty()
                         status_placeholder.empty()
-                        st.session_state["show_controls"] = False
 
                         st.sidebar.download_button(
-                            label="📥 Descargar Informes en Excel",
+                            label="📥 Descargar Informes en Excel (sesión actual)",
                             data=excel_file,
-                            file_name="Analisis_CLV_Pedalmoto.xlsx",
+                            file_name=f"Analisis_CLV_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key="download_latest"
+                            key="download_latest_session"
                         )
                     else:
                         st.error("No se pudieron procesar los datos. Revisa el CSV o el rango de fechas.")
+        elif uploaded_file is not None and uploaded_file.size == 0:
+            st.error("El archivo CSV subido está vacío. Por favor, sube un archivo con datos.")
+        elif uploaded_file is None:
+            st.info("Sube un archivo CSV para comenzar el análisis.")
 
 
-if uploaded_file is not None:
-    df_raw = pd.read_csv(uploaded_file)
-    st.session_state["df_raw"] = df_raw
 
-    # Vista previa (se limpiará tras generar informes)
-    with preview_placeholder.container():
-        st.info("Archivo subido correctamente. Mostrando primeras 5 filas:")
-        st.dataframe(df_raw.head())
 
-    # Rango de fechas para filtrar
-    fechas_preview = df_raw['fecha'].apply(convert_excel_date)
-    min_fecha = fechas_preview.min()
-    max_fecha = fechas_preview.max()
-    if pd.isna(min_fecha) or pd.isna(max_fecha):
-        min_fecha = datetime.now() - timedelta(days=365)
-        max_fecha = datetime.now()
-    st.markdown("### Filtro de fechas")
-    date_range = st.date_input(
-        "Rango (desde / hasta)",
-        value=(min_fecha.date(), max_fecha.date()),
-        min_value=min_fecha.date(),
-        max_value=max_fecha.date()
-    )
-    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-        date_start, date_end = date_range
+elif mode == "Ver informes guardados":
+    st.session_state["show_controls"] = False # Ocultar el panel de carga en este modo
+    st.markdown("### Informes CLV Guardados")
+    
+    reports_index = load_reports_index()
+    if not reports_index:
+        st.info("No hay informes guardados aún. Genera uno nuevo para empezar.")
     else:
-        date_start = min_fecha.date()
-        date_end = max_fecha.date()
+        # Ordenar informes por fecha de guardado (más reciente primero)
+        sorted_reports_items = sorted(reports_index.items(), key=lambda item: item[1]['timestamp'], reverse=True)
+        
+        report_names = [name for name, data in sorted_reports_items]
+        
+        # Selección del informe
+        selected_report_name = st.selectbox("Selecciona un informe para ver o eliminar:", report_names, 
+                                            index=report_names.index(st.session_state["selected_report"]) if st.session_state["selected_report"] and st.session_state["selected_report"] in report_names else 0,
+                                            key="select_saved_report")
 
-    if st.button("Generar / Actualizar Informes"):
-        log_box = status_placeholder.empty()
-        log = log_box.write
-        with st.spinner("Procesando datos y generando informes... Esto puede tardar unos minutos."):
-            # Preprocesamiento
-            df_processed = preprocess_data(df_raw, logger=log)
-            # Filtrar por rango seleccionado
-            if df_processed is not None and not df_processed.empty:
-                start_ts = pd.Timestamp(date_start)
-                end_ts = pd.Timestamp(date_end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-                df_processed = df_processed[
-                    (df_processed['fecha_dt'] >= start_ts) & (df_processed['fecha_dt'] <= end_ts)
-                ]
+        if selected_report_name:
+            selected_report_data = reports_index[selected_report_name]
+            st.write(f"**Informe seleccionado**: {selected_report_name}")
+            st.write(f"Guardado el: {selected_report_data['timestamp']}")
+            st.write(f"Rango de datos: {selected_report_data['date_min']} a {selected_report_data['date_max']}")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button(f"Cargar '{selected_report_name}' para visualizar", key="load_selected_report"):
+                    # Para visualizar, necesitamos cargar los DataFrames del Excel
+                    try:
+                        report_filepath = os.path.join(REPORTS_DIR, selected_report_data['filename'])
+                        if os.path.exists(report_filepath):
+                            # Leer todas las hojas del Excel en un diccionario de DataFrames
+                            all_reports_from_excel = pd.read_excel(report_filepath, sheet_name=None, index_col=0) # index_col=0 para leer el índice
+                            
+                            # Mapear los nombres de las hojas a las claves de reports
+                            loaded_reports = {
+                                "report1": all_reports_from_excel.get('Retención Trimestral'),
+                                "report2": all_reports_from_excel.get('Retención Anual'),
+                                "report3": all_reports_from_excel.get('Análisis de Supervivencia'),
+                                "report4": {
+                                    "distribucion": all_reports_from_excel.get('Frecuencia - Distribución'),
+                                    "segunda_compra": all_reports_from_excel.get('Frecuencia - 2da Compra'),
+                                    "evolucion": all_reports_from_excel.get('Frecuencia - Evolución'),
+                                    "velocidad": all_reports_from_excel.get('Frecuencia - Velocidad'),
+                                }
+                            }
+                            # Asegurarse de que report3['Total Clientes'] se maneja como entero
+                            if loaded_reports.get("report3") is not None and 'Total Clientes' in loaded_reports["report3"].columns:
+                                loaded_reports["report3"]['Total Clientes'] = loaded_reports["report3"]['Total Clientes'].fillna(0).astype(int)
+
+                            st.session_state["base_reports"] = loaded_reports
+                            st.session_state["base_summary"] = selected_report_data.get("summary", {}) # Recuperar resumen
+                            st.session_state["data_date_min"] = datetime.fromisoformat(selected_report_data['date_min']).date()
+                            st.session_state["data_date_max"] = datetime.fromisoformat(selected_report_data['date_max']).date()
+                            st.session_state["view_date_range"] = (st.session_state["data_date_min"], st.session_state["data_date_max"])
+                            st.session_state["selected_report"] = selected_report_name
+                            st.success(f"Informe '{selected_report_name}' cargado para visualización.")
+                            st.experimental_rerun() # Recargar para mostrar el informe
+                        else:
+                            st.error(f"Archivo de informe '{selected_report_data['filename']}' no encontrado.")
+                    except Exception as e:
+                        st.error(f"Error al cargar el informe '{selected_report_name}': {e}")
             
-            if df_processed is not None and not df_processed.empty:
-                # Generar informes
-                report1_df = generate_retention_report(df_processed)
-                report2_df = generate_annual_retention_report(df_processed)
-                report3_df, report3_summary = generate_survival_analysis(df_processed)
-                report4_dfs = generate_frequency_report(df_processed)
-
-                # Guardar histórico
-                all_reports = {
-                    "report1": report1_df,
-                    "report2": report2_df,
-                    "report3": report3_df,
-                    "report4": report4_dfs,
-                }
-                excel_file = export_to_excel(all_reports)
-                st.session_state["history"].insert(0, {
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "reports": all_reports,
-                    "excel_bytes": excel_file.getvalue(),
-                    "summary": report3_summary
-                })
-
-                # Limpiar vista previa y logs; dejar solo informes
-                log_box.empty()
-                preview_placeholder.empty()
-                status_placeholder.empty()
-
-                
-                # --- Botón de Descarga ---
-                st.sidebar.header("Exportar Informes")
-                
-                st.sidebar.download_button(
-                    label="📥 Descargar Informes en Excel",
-                    data=excel_file,
-                    file_name="Analisis_CLV_Pedalmoto.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-                # Histórico en sidebar
-                st.sidebar.markdown("### Historial de Informes")
-                if st.session_state["history"]:
-                    labels = [f"{i+1}. {h['timestamp']}" for i, h in enumerate(st.session_state['history'])]
-                    choice = st.sidebar.selectbox("Descargar informe previo", labels, index=0)
-                    idx = labels.index(choice)
-                    hist_item = st.session_state['history'][idx]
-                    st.sidebar.download_button(
-                        label="⬇️ Descargar selección",
-                        data=hist_item["excel_bytes"],
-                        file_name=f"Analisis_CLV_{hist_item['timestamp'].replace(' ', '_').replace(':','')}.xlsx",
+            with col2:
+                # Descargar el archivo Excel guardado
+                report_filepath = os.path.join(REPORTS_DIR, selected_report_data['filename'])
+                if os.path.exists(report_filepath):
+                    with open(report_filepath, "rb") as f:
+                        download_data = f.read()
+                    st.download_button(
+                        label=f"⬇️ Descargar '{selected_report_name}' (Excel)",
+                        data=download_data,
+                        file_name=selected_report_data['filename'],
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"download_hist_{idx}"
+                        key=f"download_saved_excel_{selected_report_name}"
                     )
-            else:
-                st.error("No se pudieron procesar los datos. Revisa el CSV.")
+                else:
+                    st.warning("Archivo Excel no encontrado, solo se puede eliminar el registro.")
 
+                if st.button(f"🗑️ Eliminar '{selected_report_name}'", key="delete_selected_report"):
+                    if st.confirm(f"¿Estás seguro de que quieres eliminar el informe '{selected_report_name}' y su archivo asociado?", key="confirm_delete"):
+                        try:
+                            # Eliminar archivo Excel
+                            report_filepath = os.path.join(REPORTS_DIR, selected_report_data['filename'])
+                            if os.path.exists(report_filepath):
+                                os.remove(report_filepath)
+                            
+                            # Eliminar de reports_index
+                            del reports_index[selected_report_name]
+                            save_reports_index(reports_index)
+                            st.success(f"Informe '{selected_report_name}' eliminado exitosamente.")
+                            st.session_state["selected_report"] = None # Resetear selección
+                            st.session_state["base_reports"] = None # Limpiar la vista actual si era el informe eliminado
+                            st.experimental_rerun() # Volver a cargar la página para actualizar la lista
+                        except Exception as e:
+                            st.error(f"Error al eliminar el informe '{selected_report_name}': {e}")
+
+
+# --- Visualización de los informes (común a ambos modos si base_reports está seteado) ---
 base_reports = st.session_state.get("base_reports")
 base_summary = st.session_state.get("base_summary")
 
@@ -750,6 +834,10 @@ if base_reports:
         data_max = today
     if "view_date_range" not in st.session_state:
         st.session_state["view_date_range"] = (data_min, data_max)
+
+    st.markdown("---")
+    st.markdown(f"## Mostrando Informe: {st.session_state.get('selected_report', 'Recién Generado')}")
+    st.markdown("---")
 
     with st.expander("Filtrar visualización por fechas", expanded=False):
         view_range = st.date_input(
@@ -780,7 +868,7 @@ if base_reports:
         - **Columnas**: Trimestres calendario
         - **Valores**: % de retención
         """)
-        if display_reports['report1'] is not None and not display_reports['report1'].empty:
+        if display_reports.get('report1') is not None and not display_reports['report1'].empty:
             show_table(
                 display_reports['report1'],
                 styler_fn=lambda d: style_percent_heatmap(d, cmap=RETENTION_CMAP),
@@ -790,7 +878,7 @@ if base_reports:
     with tab2:
         st.header("Retención Anual")
         st.markdown("Versión agregada del análisis de retención a nivel anual.")
-        if display_reports['report2'] is not None and not display_reports['report2'].empty:
+        if display_reports.get('report2') is not None and not display_reports['report2'].empty:
              show_table(
                  display_reports['report2'],
                  styler_fn=lambda d: style_percent_heatmap(d, cmap=RETENTION_CMAP),
@@ -802,16 +890,17 @@ if base_reports:
         st.markdown("""
         **Descripción**: Porcentaje de clientes de una cohorte que permanecen "activos" (realizando compras) después de un número específico de meses desde su primera compra.
         """)
-        if display_reports['report3'] is not None and not display_reports['report3'].empty:
+        if display_reports.get('report3') is not None and not display_reports['report3'].empty:
             st.subheader("Resumen Ejecutivo")
-            cols = st.columns(len(base_summary))
-            for i, (key, value) in enumerate(base_summary.items()):
-                if "%" in key:
-                    cols[i].metric(key, f"{value:.2f}%")
-                elif "días" in key or "Promedio" in key:
-                    cols[i].metric(key, f"{value:.2f}")
-                else:
-                    cols[i].metric(key, f"{int(value):,}")
+            if base_summary:
+                cols = st.columns(len(base_summary))
+                for i, (key, value) in enumerate(base_summary.items()):
+                    if "%" in key:
+                        cols[i].metric(key, f"{value:.2f}%")
+                    elif "días" in key or "Promedio" in key:
+                        cols[i].metric(key, f"{value:.2f}")
+                    else:
+                        cols[i].metric(key, f"{int(value):,}")
 
             st.subheader("Tabla de Supervivencia por Cohorte")
             show_table(
@@ -853,4 +942,7 @@ if base_reports:
                 info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
             )
 else:
-    st.warning("Por favor, sube un archivo CSV o selecciona un histórico en la barra lateral para ver informes.")
+    if mode == "Generar un nuevo informe":
+        st.info("Sube un archivo CSV para generar un nuevo informe.")
+    else: # mode == "Ver informes guardados" y no hay informes cargados
+        st.info("Selecciona un informe guardado para visualizarlo.")
