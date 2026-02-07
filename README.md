@@ -1,4 +1,4 @@
-# Aplicación de Análisis CLV para Pedalmoto
+# Aplicación de Análisus de CLV
 
 Esta es una aplicación web desarrollada en Streamlit que permite analizar datos de pedidos de un e-commerce para generar informes sobre el Customer Lifetime Value (CLV), la retención de clientes y la frecuencia de compra.
 
