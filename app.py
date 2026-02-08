@@ -760,7 +760,7 @@ def export_to_excel(reports):
 
 # --- UI de la Aplicación Streamlit ---
 
-st.set_page_config(layout="wide", page_title="Análisis CLV Pedalmoto")
+st.set_page_config(layout="wide", page_title="Análisis CLV Ecommerce")
 
 # Paletas de color más contrastadas
 RETENTION_CMAP = "RdYlGn"
@@ -808,7 +808,7 @@ mode = st.sidebar.radio(
 
 # Encabezado principal (compacto en modo ver informe)
 if mode != "Ver informe":
-    st.title("Aplicación de Análisis de Customer Lifetime Value (CLV)")
+    st.title("Análisis CLV Ecommerce")
     st.markdown("Sube un archivo CSV de pedidos para generar informes de retención y comportamiento de compra.")
 
 # Renderizar el contenido según el modo seleccionado
