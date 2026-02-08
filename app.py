@@ -5,11 +5,26 @@ from datetime import datetime, timedelta
 import io
 import os
 import json
+import re
 
 # --- Configuración de persistencia de informes ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 REPORTS_INDEX_FILE = os.path.join(REPORTS_DIR, "reports_index.json")
+
+# --- Configuración de fechas ---
+DATE_MIN_ALLOWED = datetime(2000, 1, 1)
+DATE_MAX_FUTURE_YEARS = 3
+
+DATE_FORMAT_OPTIONS = {
+    "Auto (detectar)": "auto",
+    "Excel serial (1900)": "excel_1900",
+    "Excel serial (1904)": "excel_1904",
+    "ISO (YYYY-MM-DD)": "iso",
+    "DD/MM/YYYY": "dmy",
+    "MM/DD/YYYY": "mdy",
+    "YYYYMMDD": "yyyymmdd",
+}
 
 def load_reports_index():
     if not os.path.exists(REPORTS_DIR):
@@ -53,37 +68,169 @@ def safe_rerun():
 
 # --- Funciones de Cálculo de Informes (a implementar) ---
 
-def convert_excel_date(serial_date):
-    """Convierte fecha serial de Excel a objeto datetime."""
-    try:
-        # Evitar convertir valores nulos o ya convertidos
-        if pd.isna(serial_date) or isinstance(serial_date, (datetime, pd.Timestamp)):
-            return serial_date
-        # Si es numérico, tratar como serial de Excel
-        if isinstance(serial_date, (int, float, np.integer, np.floating)):
-            return datetime(1899, 12, 30) + timedelta(days=float(serial_date))
-        # Si es string, intentar parsear como fecha (acepta ISO y DD/MM/AAAA)
-        parsed = pd.to_datetime(serial_date, errors='coerce', dayfirst=True)
-        return parsed
-    except (ValueError, TypeError):
-        return pd.NaT
+def detect_dayfirst(strings: pd.Series) -> bool:
+    """Detecta si un formato ambiguo dd/mm o mm/dd es probablemente dayfirst."""
+    if strings.empty:
+        return True
+    s = strings.astype(str).str.strip()
+    mask = s.str.match(r"^\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}$")
+    if not mask.any():
+        return True
+    parts = s[mask].str.replace("-", "/", regex=False).str.split("/")
+    day = pd.to_numeric(parts.str[0], errors="coerce")
+    month = pd.to_numeric(parts.str[1], errors="coerce")
+    dayfirst_votes = ((day > 12) & (month <= 12)).sum()
+    monthfirst_votes = ((month > 12) & (day <= 12)).sum()
+    if dayfirst_votes > monthfirst_votes:
+        return True
+    if monthfirst_votes > dayfirst_votes:
+        return False
+    return True
 
-def preprocess_data(df, logger=st.write):
+def detect_excel_origin(numeric: pd.Series) -> str:
+    """Detecta si un serial Excel parece 1900 o 1904 según rango plausible."""
+    if numeric.empty:
+        return "1900"
+    today = datetime.now()
+    max_allowed = today + timedelta(days=365 * DATE_MAX_FUTURE_YEARS)
+    min_allowed = DATE_MIN_ALLOWED
+    origin_1900 = pd.Timestamp("1899-12-30")
+    origin_1904 = pd.Timestamp("1904-01-01")
+    dates_1900 = origin_1900 + pd.to_timedelta(numeric, unit="D")
+    dates_1904 = origin_1904 + pd.to_timedelta(numeric, unit="D")
+    score_1900 = ((dates_1900 >= min_allowed) & (dates_1900 <= max_allowed)).sum()
+    score_1904 = ((dates_1904 >= min_allowed) & (dates_1904 <= max_allowed)).sum()
+    return "1904" if score_1904 > score_1900 else "1900"
+
+def parse_date_series(series: pd.Series, mode: str = "auto", logger=None) -> pd.Series:
+    """Parsea una serie de fechas manejando Excel, ISO y formatos locales."""
+    if logger is None:
+        logger = lambda *args, **kwargs: None
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+
+    s = series.copy()
+    str_s = s.astype(str).str.strip()
+    iso_mask = str_s.str.match(r"^\\d{4}[-/]\\d{1,2}[-/]\\d{1,2}$")
+    yyyymmdd_mask = str_s.str.match(r"^\\d{8}$")
+
+    def parse_excel(numeric, origin):
+        base = pd.Timestamp("1899-12-30") if origin == "1900" else pd.Timestamp("1904-01-01")
+        return base + pd.to_timedelta(numeric, unit="D")
+
+    if mode == "excel_1900":
+        numeric = pd.to_numeric(s, errors="coerce")
+        logger("Formato forzado: Excel serial (1900)")
+        return parse_excel(numeric, "1900")
+    if mode == "excel_1904":
+        numeric = pd.to_numeric(s, errors="coerce")
+        logger("Formato forzado: Excel serial (1904)")
+        return parse_excel(numeric, "1904")
+    if mode == "iso":
+        logger("Formato forzado: ISO (YYYY-MM-DD)")
+        return pd.to_datetime(str_s, errors="coerce", dayfirst=False)
+    if mode == "dmy":
+        logger("Formato forzado: DD/MM/YYYY")
+        result = pd.Series(pd.NaT, index=s.index)
+        if iso_mask.any():
+            result.loc[iso_mask] = pd.to_datetime(str_s[iso_mask], errors="coerce", dayfirst=False)
+        result.loc[~iso_mask] = pd.to_datetime(str_s[~iso_mask], errors="coerce", dayfirst=True)
+        return result
+    if mode == "mdy":
+        logger("Formato forzado: MM/DD/YYYY")
+        result = pd.Series(pd.NaT, index=s.index)
+        if iso_mask.any():
+            result.loc[iso_mask] = pd.to_datetime(str_s[iso_mask], errors="coerce", dayfirst=False)
+        result.loc[~iso_mask] = pd.to_datetime(str_s[~iso_mask], errors="coerce", dayfirst=False)
+        return result
+    if mode == "yyyymmdd":
+        logger("Formato forzado: YYYYMMDD")
+        return pd.to_datetime(str_s, errors="coerce", format="%Y%m%d")
+
+    # --- Modo auto ---
+    if yyyymmdd_mask.mean() > 0.7:
+        logger("Formato detectado: YYYYMMDD")
+        return pd.to_datetime(str_s, errors="coerce", format="%Y%m%d")
+
+    numeric = pd.to_numeric(s, errors="coerce")
+    numeric_ratio = numeric.notna().mean()
+
+    # Si parece numérico, decidir entre YYYYMMDD o Excel
+    if numeric_ratio > 0.7:
+        numeric_nonnull = numeric[numeric.notna()]
+        yyyymmdd_ratio_num = ((numeric_nonnull % 1 == 0) & numeric_nonnull.between(19000101, 21001231)).mean()
+        if yyyymmdd_ratio_num > 0.7:
+            logger("Formato detectado: YYYYMMDD (numérico)")
+            result = pd.Series(pd.NaT, index=s.index)
+            result.loc[numeric_nonnull.index] = pd.to_datetime(
+                numeric_nonnull.astype(int).astype(str), errors="coerce", format="%Y%m%d"
+            ).values
+            rest_idx = s.index[~numeric.notna()]
+            if len(rest_idx):
+                result.loc[rest_idx] = parse_date_series(s.loc[rest_idx], mode="auto", logger=logger).values
+            return result
+
+        origin = detect_excel_origin(numeric_nonnull)
+        logger(f"Formato detectado: Excel serial ({origin})")
+        result = parse_excel(numeric, origin)
+        rest_idx = s.index[~numeric.notna()]
+        if len(rest_idx):
+            result = result.copy()
+            result.loc[rest_idx] = parse_date_series(s.loc[rest_idx], mode="auto", logger=logger).values
+        return result
+
+    if iso_mask.mean() > 0.6:
+        logger("Formato detectado: ISO (YYYY-MM-DD)")
+        return pd.to_datetime(str_s, errors="coerce", dayfirst=False)
+
+    dayfirst = detect_dayfirst(str_s)
+    logger(f"Formato detectado: {'DD/MM/YYYY' if dayfirst else 'MM/DD/YYYY'} (auto)")
+    result = pd.Series(pd.NaT, index=s.index)
+    if iso_mask.any():
+        result.loc[iso_mask] = pd.to_datetime(str_s[iso_mask], errors="coerce", dayfirst=False)
+    result.loc[~iso_mask] = pd.to_datetime(str_s[~iso_mask], errors="coerce", dayfirst=dayfirst)
+    return result
+
+def preprocess_data(df, logger=st.write, date_mode="auto"):
     """Limpia y preprocesa el DataFrame."""
     logger("Iniciando preprocesamiento de datos...")
     
     # Validar columnas
-    required_columns = ['fecha', 'cod_cliente', 'Total_pagado']
+    required_columns = ['cod_cliente', 'Total_pagado']
     if not all(col in df.columns for col in required_columns):
         missing = [col for col in required_columns if col not in df.columns]
         logger(f"Faltan columnas requeridas: {', '.join(missing)}")
         return None
+    if 'fecha' not in df.columns and 'fecha_hora' not in df.columns:
+        logger("Falta columna de fecha: se requiere 'fecha' o 'fecha_hora'.")
+        return None
 
     # Conversión de fechas
     logger("Convirtiendo fechas...")
-    df['fecha_dt'] = df['fecha'].apply(convert_excel_date)
-    df = df.dropna(subset=['fecha_dt']) # Eliminar filas con fechas inválidas
-    logger(f"Filas después de limpiar fechas: {len(df):,}")
+    fecha_dt = None
+    if 'fecha' in df.columns:
+        fecha_dt = parse_date_series(df['fecha'], mode=date_mode, logger=logger)
+    if fecha_dt is None:
+        fecha_dt = pd.Series(pd.NaT, index=df.index)
+    if 'fecha_hora' in df.columns:
+        fecha_hora_dt = parse_date_series(df['fecha_hora'], mode="auto", logger=logger)
+        missing_before = fecha_dt.isna().sum()
+        fecha_dt = fecha_dt.fillna(fecha_hora_dt)
+        filled = missing_before - fecha_dt.isna().sum()
+        if filled > 0:
+            logger(f"Se completaron {filled:,} fechas usando 'fecha_hora'.")
+    df['fecha_dt'] = fecha_dt
+
+    # Eliminar fechas inválidas o fuera de rango razonable
+    before = len(df)
+    df = df.dropna(subset=['fecha_dt'])
+    min_allowed = DATE_MIN_ALLOWED
+    max_allowed = datetime.now() + timedelta(days=365 * DATE_MAX_FUTURE_YEARS)
+    out_of_range = (~df['fecha_dt'].between(min_allowed, max_allowed)).sum()
+    if out_of_range > 0:
+        logger(f"Se eliminaron {out_of_range:,} filas con fechas fuera de rango ({min_allowed.date()} a {max_allowed.date()}).")
+    df = df[df['fecha_dt'].between(min_allowed, max_allowed)]
+    logger(f"Filas después de limpiar fechas: {len(df):,} (antes: {before:,})")
     df = df.sort_values('fecha_dt')
 
     # Conversión de total pagado
@@ -215,7 +362,8 @@ def generate_survival_analysis(df):
     report_df = report_df[cols]
     
     # Calcular "Activos Hoy" (compras en los últimos 90 días)
-    activos_hoy = df[df['fecha_dt'] >= (reference_date - timedelta(days=90))]['cod_cliente'].nunique()
+    active_window_start = reference_date - timedelta(days=90)
+    activos_hoy = df[df['fecha_dt'] >= active_window_start]['cod_cliente'].nunique()
     total_clientes = df['cod_cliente'].nunique()
     one_time_buyers = agg_stats[agg_stats['total_pedidos'] == 1]['cod_cliente'].nunique()
 
@@ -226,8 +374,13 @@ def generate_survival_analysis(df):
         "Promedio de pedidos por cliente": agg_stats['total_pedidos'].mean(),
         "% de clientes con 1 sola compra": (one_time_buyers / total_clientes) * 100 if total_clientes > 0 else 0
     }
+
+    active_window = {
+        "start": active_window_start.date(),
+        "end": reference_date.date()
+    }
     
-    return report_df, summary
+    return report_df, summary, active_window
 
 
 def generate_frequency_report(df):
@@ -567,6 +720,10 @@ if "last_generated_summary" not in st.session_state:
     st.session_state["last_generated_summary"] = None
 if "last_generated_range" not in st.session_state:
     st.session_state["last_generated_range"] = None
+if "last_generated_active_window" not in st.session_state:
+    st.session_state["last_generated_active_window"] = None
+if "base_active_window" not in st.session_state:
+    st.session_state["base_active_window"] = None
 if "delete_candidate" not in st.session_state:
     st.session_state["delete_candidate"] = None
 
@@ -590,6 +747,7 @@ if st.session_state["history"]:
     # Guardar como base para la visualización principal
     st.session_state["base_reports"] = hist_item["reports"]
     st.session_state["base_summary"] = hist_item["summary"]
+    st.session_state["base_active_window"] = hist_item.get("active_window")
     # Inferir rango de fechas disponible para filtros de vista
     def extract_dates_from_reports(reports):
         dates = []
@@ -638,9 +796,33 @@ if mode == "Generar un nuevo informe":
             preview_placeholder.info("Archivo subido correctamente. Mostrando primeras 5 filas:")
             preview_placeholder.dataframe(st.session_state["df_raw"].head())
 
-            fechas_preview = st.session_state["df_raw"]['fecha'].apply(convert_excel_date)
-            min_fecha = fechas_preview.min()
-            max_fecha = fechas_preview.max()
+            # Selección de formato de fecha (para evitar interpretaciones ambiguas)
+            fmt_labels = list(DATE_FORMAT_OPTIONS.keys())
+            default_idx = 0
+            selected_fmt = st.selectbox(
+                "Formato de fecha",
+                fmt_labels,
+                index=default_idx,
+                key="date_format_select"
+            )
+            st.session_state["date_format_mode"] = DATE_FORMAT_OPTIONS.get(selected_fmt, "auto")
+
+            fechas_preview = None
+            if 'fecha' in st.session_state["df_raw"].columns:
+                fechas_preview = parse_date_series(
+                    st.session_state["df_raw"]['fecha'],
+                    mode=st.session_state["date_format_mode"]
+                )
+            if (fechas_preview is None or fechas_preview.isna().all()) and 'fecha_hora' in st.session_state["df_raw"].columns:
+                fechas_preview = parse_date_series(st.session_state["df_raw"]['fecha_hora'], mode="auto")
+                st.info("Usando 'fecha_hora' para detectar el rango porque 'fecha' no es válida.")
+
+            if fechas_preview is None or fechas_preview.isna().all():
+                min_fecha = datetime.now() - timedelta(days=365)
+                max_fecha = datetime.now()
+            else:
+                min_fecha = fechas_preview.min()
+                max_fecha = fechas_preview.max()
             if pd.isna(min_fecha) or pd.isna(max_fecha):
                 min_fecha = datetime.now() - timedelta(days=365)
                 max_fecha = datetime.now()
@@ -662,7 +844,8 @@ if mode == "Generar un nuevo informe":
                 log_box = status_placeholder.empty()
                 log = log_box.write
                 with st.spinner("Procesando datos y generando informes... Esto puede tardar unos minutos."):
-                    df_processed = preprocess_data(st.session_state["df_raw"].copy(), logger=log) # Usar df_raw del session_state
+                    date_mode = st.session_state.get("date_format_mode", "auto")
+                    df_processed = preprocess_data(st.session_state["df_raw"].copy(), logger=log, date_mode=date_mode) # Usar df_raw del session_state
                     if df_processed is not None and not df_processed.empty:
                         start_ts = pd.Timestamp(date_start)
                         end_ts = pd.Timestamp(date_end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
@@ -673,7 +856,7 @@ if mode == "Generar un nuevo informe":
                     if df_processed is not None and not df_processed.empty:
                         report1_df = generate_retention_report(df_processed)
                         report2_df = generate_annual_retention_report(df_processed)
-                        report3_df, report3_summary = generate_survival_analysis(df_processed)
+                        report3_df, report3_summary, report3_active_window = generate_survival_analysis(df_processed)
                         report4_dfs = generate_frequency_report(df_processed)
 
                         all_reports = {
@@ -689,12 +872,14 @@ if mode == "Generar un nuevo informe":
                             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
                             "reports": all_reports,
                             "excel_bytes": excel_bytes,
-                            "summary": report3_summary
+                            "summary": report3_summary,
+                            "active_window": report3_active_window
                         })
                         # Guardar como base para vista y rango por defecto para la sesión
                         # Si no se guarda persistentemente, sigue siendo visible en la sesión
                         st.session_state["base_reports"] = all_reports
                         st.session_state["base_summary"] = report3_summary
+                        st.session_state["base_active_window"] = report3_active_window
                         st.session_state["data_date_min"] = df_processed['fecha_dt'].min().date()
                         st.session_state["data_date_max"] = df_processed['fecha_dt'].max().date()
                         st.session_state["view_date_range"] = (st.session_state["data_date_min"], st.session_state["data_date_max"])
@@ -703,6 +888,7 @@ if mode == "Generar un nuevo informe":
                         st.session_state["last_generated_excel_bytes"] = excel_bytes
                         st.session_state["last_generated_reports"] = all_reports
                         st.session_state["last_generated_summary"] = report3_summary
+                        st.session_state["last_generated_active_window"] = report3_active_window
                         st.session_state["last_generated_range"] = (date_start, date_end)
                         st.session_state["save_report_name_input"] = f"Informe CLV {datetime.now().strftime('%Y%m%d_%H%M')}"
 
@@ -746,12 +932,17 @@ if mode == "Generar un nuevo informe":
 
                     date_start, date_end = st.session_state.get("last_generated_range", (None, None))
                     json_safe_summary = make_json_safe(st.session_state.get("last_generated_summary", {}))
+                    active_window = st.session_state.get("last_generated_active_window") or {}
+                    active_start = active_window.get("start")
+                    active_end = active_window.get("end")
                     reports_index[report_name_input] = {
                         "filename": os.path.basename(report_filepath),
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "date_min": date_start.isoformat() if date_start else "",
                         "date_max": date_end.isoformat() if date_end else "",
-                        "summary": json_safe_summary
+                        "summary": json_safe_summary,
+                        "active_window_start": active_start.isoformat() if active_start else "",
+                        "active_window_end": active_end.isoformat() if active_end else ""
                     }
                     save_reports_index(reports_index)
                     st.success(f"Informe '{report_name_input}' guardado exitosamente.")
@@ -774,30 +965,29 @@ elif mode == "Ver informes guardados":
         # Ordenar informes por fecha de guardado (más reciente primero)
         sorted_reports_items = sorted(reports_index.items(), key=lambda item: item[1]['timestamp'], reverse=True)
         
-        report_names = [name for name, data in sorted_reports_items]
-        
-        # Selección del informe
-        selected_report_name = st.selectbox("Selecciona un informe para ver o eliminar:", report_names, 
-                                            index=report_names.index(st.session_state["selected_report"]) if st.session_state["selected_report"] and st.session_state["selected_report"] in report_names else 0,
-                                            key="select_saved_report")
+        if st.session_state.get("selected_report"):
+            st.caption(f"Informe cargado actualmente: {st.session_state['selected_report']}")
 
-        if selected_report_name:
-            selected_report_data = reports_index[selected_report_name]
-            st.write(f"**Informe seleccionado**: {selected_report_name}")
-            st.write(f"Guardado el: {selected_report_data['timestamp']}")
-            st.write(f"Rango de datos: {selected_report_data['date_min']} a {selected_report_data['date_max']}")
+        header = st.columns([3, 2, 3, 1.3, 1.7, 1.2])
+        header[0].markdown("**Informe**")
+        header[1].markdown("**Guardado el**")
+        header[2].markdown("**Rango de datos**")
+        header[3].markdown("**Cargar**")
+        header[4].markdown("**Descargar**")
+        header[5].markdown("**Eliminar**")
 
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button(f"Cargar '{selected_report_name}' para visualizar", key="load_selected_report"):
-                    # Para visualizar, necesitamos cargar los DataFrames del Excel
+        for i, (report_name, report_data) in enumerate(sorted_reports_items):
+            row = st.columns([3, 2, 3, 1.3, 1.7, 1.2])
+            row[0].write(report_name)
+            row[1].write(report_data.get("timestamp", ""))
+            row[2].write(f"{report_data.get('date_min', '')} a {report_data.get('date_max', '')}")
+
+            with row[3]:
+                if st.button("Cargar", key=f"load_report_{i}"):
                     try:
-                        report_filepath = os.path.join(REPORTS_DIR, selected_report_data['filename'])
+                        report_filepath = os.path.join(REPORTS_DIR, report_data["filename"])
                         if os.path.exists(report_filepath):
-                            # Leer todas las hojas del Excel en un diccionario de DataFrames
-                            all_reports_from_excel = pd.read_excel(report_filepath, sheet_name=None, index_col=0) # index_col=0 para leer el índice
-                            
-                            # Mapear los nombres de las hojas a las claves de reports
+                            all_reports_from_excel = pd.read_excel(report_filepath, sheet_name=None, index_col=0)
                             loaded_reports = {
                                 "report1": all_reports_from_excel.get('Retención Trimestral'),
                                 "report2": all_reports_from_excel.get('Retención Anual'),
@@ -809,73 +999,80 @@ elif mode == "Ver informes guardados":
                                     "velocidad": all_reports_from_excel.get('Frecuencia - Velocidad'),
                                 }
                             }
-                            # Asegurarse de que report3['Total Clientes'] se maneja como entero
                             if loaded_reports.get("report3") is not None and 'Total Clientes' in loaded_reports["report3"].columns:
                                 loaded_reports["report3"]['Total Clientes'] = loaded_reports["report3"]['Total Clientes'].fillna(0).astype(int)
 
                             st.session_state["base_reports"] = loaded_reports
-                            st.session_state["base_summary"] = selected_report_data.get("summary", {}) # Recuperar resumen
-                            st.session_state["data_date_min"] = datetime.fromisoformat(selected_report_data['date_min']).date()
-                            st.session_state["data_date_max"] = datetime.fromisoformat(selected_report_data['date_max']).date()
-                            st.session_state["view_date_range"] = (st.session_state["data_date_min"], st.session_state["data_date_max"])
-                            st.session_state["selected_report"] = selected_report_name
-                            st.success(f"Informe '{selected_report_name}' cargado para visualización.")
-                            safe_rerun() # Recargar para mostrar el informe
+                            st.session_state["base_summary"] = report_data.get("summary", {})
+                            aw_start = report_data.get("active_window_start")
+                            aw_end = report_data.get("active_window_end")
+                            if aw_start and aw_end:
+                                st.session_state["base_active_window"] = {
+                                    "start": datetime.fromisoformat(aw_start).date(),
+                                    "end": datetime.fromisoformat(aw_end).date(),
+                                }
+                            else:
+                                st.session_state["base_active_window"] = None
+                            st.session_state["data_date_min"] = datetime.fromisoformat(report_data['date_min']).date() if report_data.get('date_min') else None
+                            st.session_state["data_date_max"] = datetime.fromisoformat(report_data['date_max']).date() if report_data.get('date_max') else None
+                            if st.session_state["data_date_min"] and st.session_state["data_date_max"]:
+                                st.session_state["view_date_range"] = (st.session_state["data_date_min"], st.session_state["data_date_max"])
+                            st.session_state["selected_report"] = report_name
+                            st.success(f"Informe '{report_name}' cargado para visualización.")
+                            safe_rerun()
                         else:
-                            st.error(f"Archivo de informe '{selected_report_data['filename']}' no encontrado.")
+                            st.error(f"Archivo de informe '{report_data['filename']}' no encontrado.")
                     except Exception as e:
-                        st.error(f"Error al cargar el informe '{selected_report_name}': {e}")
-            
-            with col2:
-                # Descargar el archivo Excel guardado
-                report_filepath = os.path.join(REPORTS_DIR, selected_report_data['filename'])
+                        st.error(f"Error al cargar el informe '{report_name}': {e}")
+
+            with row[4]:
+                report_filepath = os.path.join(REPORTS_DIR, report_data["filename"])
                 if os.path.exists(report_filepath):
                     with open(report_filepath, "rb") as f:
                         download_data = f.read()
                     st.download_button(
-                        label=f"⬇️ Descargar '{selected_report_name}' (Excel)",
+                        label="Descargar",
                         data=download_data,
-                        file_name=selected_report_data['filename'],
+                        file_name=report_data["filename"],
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"download_saved_excel_{selected_report_name}"
+                        key=f"download_saved_excel_{i}"
                     )
                 else:
-                    st.warning("Archivo Excel no encontrado, solo se puede eliminar el registro.")
+                    st.caption("No encontrado")
 
-                if st.button(f"🗑️ Eliminar '{selected_report_name}'", key="delete_selected_report"):
-                    st.session_state["delete_candidate"] = selected_report_name
+            with row[5]:
+                if st.button("Eliminar", key=f"delete_saved_{i}"):
+                    st.session_state["delete_candidate"] = report_name
 
-                if st.session_state.get("delete_candidate") == selected_report_name:
-                    st.warning(
-                        f"¿Confirmas eliminar el informe '{selected_report_name}' y su archivo asociado?"
-                    )
-                    del_col1, del_col2 = st.columns(2)
-                    with del_col1:
-                        if st.button("Confirmar eliminación", key="confirm_delete"):
-                            try:
-                                # Eliminar archivo Excel
-                                report_filepath = os.path.join(REPORTS_DIR, selected_report_data['filename'])
-                                if os.path.exists(report_filepath):
-                                    os.remove(report_filepath)
-                                
-                                # Eliminar de reports_index
-                                del reports_index[selected_report_name]
-                                save_reports_index(reports_index)
-                                st.success(f"Informe '{selected_report_name}' eliminado exitosamente.")
-                                st.session_state["selected_report"] = None # Resetear selección
-                                st.session_state["base_reports"] = None # Limpiar la vista actual si era el informe eliminado
-                                st.session_state["delete_candidate"] = None
-                                safe_rerun() # Volver a cargar la página para actualizar la lista
-                            except Exception as e:
-                                st.error(f"Error al eliminar el informe '{selected_report_name}': {e}")
-                    with del_col2:
-                        if st.button("Cancelar", key="cancel_delete"):
+            if st.session_state.get("delete_candidate") == report_name:
+                st.warning(f"¿Confirmas eliminar el informe '{report_name}' y su archivo asociado?")
+                del_col1, del_col2 = st.columns(2)
+                with del_col1:
+                    if st.button("Confirmar eliminación", key=f"confirm_delete_{i}"):
+                        try:
+                            report_filepath = os.path.join(REPORTS_DIR, report_data["filename"])
+                            if os.path.exists(report_filepath):
+                                os.remove(report_filepath)
+
+                            del reports_index[report_name]
+                            save_reports_index(reports_index)
+                            st.success(f"Informe '{report_name}' eliminado exitosamente.")
+                            if st.session_state.get("selected_report") == report_name:
+                                st.session_state["selected_report"] = None
+                                st.session_state["base_reports"] = None
                             st.session_state["delete_candidate"] = None
+                            safe_rerun()
+                        except Exception as e:
+                            st.error(f"Error al eliminar el informe '{report_name}': {e}")
+                with del_col2:
+                    if st.button("Cancelar", key=f"cancel_delete_{i}"):
+                        st.session_state["delete_candidate"] = None
 
 
 # --- Visualización de los informes (común a ambos modos si base_reports está seteado) ---
 base_reports = st.session_state.get("base_reports")
 base_summary = st.session_state.get("base_summary")
+base_active_window = st.session_state.get("base_active_window")
 
 if base_reports:
     data_min = st.session_state.get("data_date_min")
@@ -920,6 +1117,18 @@ if base_reports:
         - **Columnas**: Trimestres calendario
         - **Valores**: % de retención
         """)
+        with st.expander("❓ Ayuda: ¿Cómo interpretar la tabla?", expanded=False):
+            st.markdown(
+                "Cada celda indica el **porcentaje de clientes** de la cohorte (fila) que realizaron **al menos una compra** "
+                "en el periodo (columna). No es porcentaje de pedidos."
+            )
+            st.markdown(
+                "Ejemplo: si en la fila `Y2020-Q4` y la columna `Y2023-Q3` aparece `2.4%`, "
+                "significa que **el 2.4% de los clientes cuya primera compra fue en Y2020‑Q4 compraron al menos una vez en Y2023‑Q3**."
+            )
+            st.markdown(
+                "Pistas rápidas: la diagonal suele ser `100%` (primera compra) y los periodos **anteriores a la cohorte** aparecen como `0%`."
+            )
         if display_reports.get('report1') is not None and not display_reports['report1'].empty:
             show_table(
                 display_reports['report1'],
@@ -930,6 +1139,18 @@ if base_reports:
     with tab2:
         st.header("Retención Anual")
         st.markdown("Versión agregada del análisis de retención a nivel anual.")
+        with st.expander("❓ Ayuda: ¿Cómo interpretar la tabla?", expanded=False):
+            st.markdown(
+                "Cada celda indica el **porcentaje de clientes** de la cohorte (fila) que realizaron **al menos una compra** "
+                "en el año (columna). No es porcentaje de pedidos."
+            )
+            st.markdown(
+                "Ejemplo: si en la fila `2020` y la columna `2023` aparece `2.4%`, "
+                "significa que **el 2.4% de los clientes cuya primera compra fue en 2020 compraron al menos una vez en 2023**."
+            )
+            st.markdown(
+                "Pistas rápidas: la diagonal suele ser `100%` y los años **anteriores a la cohorte** aparecen como `0%`."
+            )
         if display_reports.get('report2') is not None and not display_reports['report2'].empty:
              show_table(
                  display_reports['report2'],
@@ -949,10 +1170,17 @@ if base_reports:
                 for i, (key, value) in enumerate(base_summary.items()):
                     if "%" in key:
                         cols[i].metric(key, f"{value:.2f}%")
+                    elif key.startswith("Clientes activos"):
+                        cols[i].metric(key, f"{int(value):,}")
                     elif "días" in key or "Promedio" in key:
                         cols[i].metric(key, f"{value:.2f}")
                     else:
                         cols[i].metric(key, f"{int(value):,}")
+            if base_active_window:
+                st.caption(
+                    f"Ventana usada para 'Clientes activos (últimos 90 días)': "
+                    f"{base_active_window['start']} a {base_active_window['end']}"
+                )
 
             st.subheader("Tabla de Supervivencia por Cohorte")
             show_table(
