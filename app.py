@@ -66,6 +66,15 @@ def safe_rerun():
     elif hasattr(st, "experimental_rerun"):
         st.experimental_rerun()
 
+def help_popup(title, render_fn):
+    """Muestra ayuda en popup si está disponible; fallback a expander."""
+    if hasattr(st, "popover"):
+        with st.popover(title):
+            render_fn()
+    else:
+        with st.expander(title, expanded=False):
+            render_fn()
+
 # --- Funciones de Cálculo de Informes (a implementar) ---
 
 def detect_dayfirst(strings: pd.Series) -> bool:
@@ -566,6 +575,63 @@ def style_currency(df, cols):
     fmt = {col: "€{:.2f}" for col in cols if col in df.columns}
     return df.style.format(fmt)
 
+def style_frequency_distribucion(df):
+    if df is None or df.empty:
+        return df
+    styled = df.style.format({
+        'Total_Intervalos': "{:,.0f}",
+        '% del Total': "{:.2f}%",
+        'Dias_Promedio': "{:.1f}",
+        'Dias_Mediana': "{:.1f}",
+    })
+    if '% del Total' in df.columns:
+        styled = styled.background_gradient(cmap=RETENTION_CMAP, subset=['% del Total'])
+    day_cols = [c for c in ['Dias_Promedio', 'Dias_Mediana'] if c in df.columns]
+    if day_cols:
+        styled = styled.background_gradient(cmap=FREQ_DISTRIB_CMAP, subset=day_cols)
+    return styled
+
+def style_frequency_second_purchase(df):
+    if df is None or df.empty:
+        return df
+    styled = df.style.format({
+        'Clientes': "{:,.0f}",
+        '% del Total': "{:.2f}%"
+    })
+    if '% del Total' in df.columns:
+        styled = styled.background_gradient(cmap=RETENTION_CMAP, subset=['% del Total'])
+    return styled
+
+def style_frequency_evolucion(df):
+    if df is None or df.empty:
+        return df
+    styled = df.style.format({
+        'Numero_Clientes': "{:,.0f}",
+        'Dias_Promedio_Intervalo': "{:.1f}",
+        'Dias_Mediana_Intervalo': "{:.1f}",
+    })
+    day_cols = [c for c in ['Dias_Promedio_Intervalo', 'Dias_Mediana_Intervalo'] if c in df.columns]
+    if day_cols:
+        styled = styled.background_gradient(cmap=FREQ_EVOL_CMAP, subset=day_cols)
+    return styled
+
+def style_frequency_velocidad(df):
+    if df is None or df.empty:
+        return df
+    styled = df.style.format({
+        'Numero_Clientes': "{:,.0f}",
+        'Compras_por_Mes_Promedio': "{:.2f}",
+        'Pedidos_Promedio': "{:.2f}",
+        'Revenue_Promedio': "€{:.2f}",
+        '% del Total': "{:.2f}%"
+    })
+    grad_cols = [c for c in ['Compras_por_Mes_Promedio', 'Pedidos_Promedio', 'Revenue_Promedio'] if c in df.columns]
+    if grad_cols:
+        styled = styled.background_gradient(cmap=FREQ_VEL_CMAP, subset=grad_cols)
+    if '% del Total' in df.columns:
+        styled = styled.background_gradient(cmap=RETENTION_CMAP, subset=['% del Total'])
+    return styled
+
 def styler_supported():
     """Devuelve True si la versión de Streamlit permite renderizar pandas.Styler en st.dataframe."""
     try:
@@ -703,11 +769,6 @@ FREQ_DISTRIB_CMAP = "BuGn"
 FREQ_EVOL_CMAP = "PuBu"
 FREQ_VEL_CMAP = "OrRd"
 
-st.title("Aplicación de Análisis de Customer Lifetime Value (CLV)")
-st.markdown("Sube un archivo CSV de pedidos para generar informes de retención y comportamiento de compra.")
-
-if "history" not in st.session_state:
-    st.session_state["history"] = []
 if "df_raw" not in st.session_state: # Inicializar df_raw también
     st.session_state["df_raw"] = None
 if "selected_report" not in st.session_state: # Para almacenar el nombre del informe cargado/generado
@@ -726,62 +787,32 @@ if "base_active_window" not in st.session_state:
     st.session_state["base_active_window"] = None
 if "delete_candidate" not in st.session_state:
     st.session_state["delete_candidate"] = None
+if "nav_to" not in st.session_state:
+    st.session_state["nav_to"] = None
 
 preview_placeholder = st.empty()
 status_placeholder = st.empty()
 
-# ---- Histórico disponible incluso sin subir archivo ----
-if st.session_state["history"]:
-    st.sidebar.markdown("### Historial de Informes")
-    labels = [f"{i+1}. {h['timestamp']}" for i, h in enumerate(st.session_state['history'])]
-    choice = st.sidebar.selectbox("Ver / descargar informe previo", labels)
-    idx = labels.index(choice)
-    hist_item = st.session_state['history'][idx]
-    st.sidebar.download_button(
-        label="⬇️ Descargar selección",
-        data=hist_item["excel_bytes"],
-        file_name=f"Analisis_CLV_{hist_item['timestamp'].replace(' ', '_').replace(':','')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=f"download_hist_side_{idx}"
-    )
-    # Guardar como base para la visualización principal
-    st.session_state["base_reports"] = hist_item["reports"]
-    st.session_state["base_summary"] = hist_item["summary"]
-    st.session_state["base_active_window"] = hist_item.get("active_window")
-    # Inferir rango de fechas disponible para filtros de vista
-    def extract_dates_from_reports(reports):
-        dates = []
-        r1 = reports.get('report1')
-        if r1 is not None and not r1.empty:
-            idx_period = r1.index.to_series().apply(lambda x: pd.Period(str(x).replace('Y',''), freq='Q'))
-            col_period = pd.Series(r1.columns[1:], index=r1.columns[1:]).apply(lambda x: pd.Period(str(x).replace('Y',''), freq='Q'))
-            dates += list(idx_period.dt.start_time.dt.date)
-            dates += list(col_period.dt.start_time.dt.date)
-        r2 = reports.get('report2')
-        if r2 is not None and not r2.empty:
-            idx_period = r2.index.to_series().apply(lambda x: pd.Period(str(x), freq='Y'))
-            col_period = pd.Series(r2.columns[1:], index=r2.columns[1:]).apply(lambda x: pd.Period(str(x), freq='Y'))
-            dates += list(idx_period.dt.start_time.dt.date)
-            dates += list(col_period.dt.start_time.dt.date)
-        return dates
-    dates_available = extract_dates_from_reports(st.session_state["base_reports"])
-    if dates_available:
-        st.session_state["data_date_min"] = min(dates_available)
-        st.session_state["data_date_max"] = max(dates_available)
-        st.session_state["view_date_range"] = (st.session_state["data_date_min"], st.session_state["data_date_max"])
-
-# Opción principal: Generar nuevo o cargar existente
+# Navegación principal
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Opciones Principales")
+if st.session_state.get("nav_to"):
+    st.session_state["app_mode"] = st.session_state["nav_to"]
+    st.session_state["nav_to"] = None
 mode = st.sidebar.radio(
     "¿Qué deseas hacer?",
-    ("Generar un nuevo informe", "Ver informes guardados"),
-    index=0 if not st.session_state.get("base_reports") else 1, # Por defecto, si ya hay informe, ir a ver guardados
+    ("Generar informe", "Informes guardados", "Ver informe"),
+    index=2 if st.session_state.get("base_reports") else 0,
     key="app_mode"
 )
 
+# Encabezado principal (compacto en modo ver informe)
+if mode != "Ver informe":
+    st.title("Aplicación de Análisis de Customer Lifetime Value (CLV)")
+    st.markdown("Sube un archivo CSV de pedidos para generar informes de retención y comportamiento de compra.")
+
 # Renderizar el contenido según el modo seleccionado
-if mode == "Generar un nuevo informe":
+if mode == "Generar informe":
     st.session_state["show_controls"] = True # Forzar la visualización del panel de carga en este modo
 
     # ---- Panel de carga y generación ----
@@ -868,13 +899,6 @@ if mode == "Generar un nuevo informe":
                         excel_file = export_to_excel(all_reports) # Se devuelve el io.BytesIO
                         excel_bytes = excel_file.getvalue()
 
-                        st.session_state["history"].insert(0, {
-                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                            "reports": all_reports,
-                            "excel_bytes": excel_bytes,
-                            "summary": report3_summary,
-                            "active_window": report3_active_window
-                        })
                         # Guardar como base para vista y rango por defecto para la sesión
                         # Si no se guarda persistentemente, sigue siendo visible en la sesión
                         st.session_state["base_reports"] = all_reports
@@ -951,10 +975,15 @@ if mode == "Generar un nuevo informe":
             else:
                 st.warning("Por favor, introduce un nombre para el informe.")
 
+        if st.session_state.get("base_reports"):
+            if st.button("Ver informe ahora", key="go_view_report"):
+                st.session_state["nav_to"] = "Ver informe"
+                safe_rerun()
 
 
 
-elif mode == "Ver informes guardados":
+
+elif mode == "Informes guardados":
     st.session_state["show_controls"] = False # Ocultar el panel de carga en este modo
     st.markdown("### Informes CLV Guardados")
     
@@ -1019,6 +1048,7 @@ elif mode == "Ver informes guardados":
                                 st.session_state["view_date_range"] = (st.session_state["data_date_min"], st.session_state["data_date_max"])
                             st.session_state["selected_report"] = report_name
                             st.success(f"Informe '{report_name}' cargado para visualización.")
+                            st.session_state["nav_to"] = "Ver informe"
                             safe_rerun()
                         else:
                             st.error(f"Archivo de informe '{report_data['filename']}' no encontrado.")
@@ -1069,160 +1099,241 @@ elif mode == "Ver informes guardados":
                         st.session_state["delete_candidate"] = None
 
 
-# --- Visualización de los informes (común a ambos modos si base_reports está seteado) ---
-base_reports = st.session_state.get("base_reports")
-base_summary = st.session_state.get("base_summary")
-base_active_window = st.session_state.get("base_active_window")
+# --- Visualización de los informes (solo en modo "Ver informe") ---
+if mode == "Ver informe":
+    base_reports = st.session_state.get("base_reports")
+    base_summary = st.session_state.get("base_summary")
+    base_active_window = st.session_state.get("base_active_window")
 
-if base_reports:
-    data_min = st.session_state.get("data_date_min")
-    data_max = st.session_state.get("data_date_max")
-    if not data_min or not data_max:
-        today = datetime.now().date()
-        data_min = today - timedelta(days=365)
-        data_max = today
-    if "view_date_range" not in st.session_state:
-        st.session_state["view_date_range"] = (data_min, data_max)
+    if base_reports:
+        st.markdown(f"## Informe: {st.session_state.get('selected_report', 'Recién Generado')}")
+        data_min = st.session_state.get("data_date_min")
+        data_max = st.session_state.get("data_date_max")
+        if not data_min or not data_max:
+            today = datetime.now().date()
+            data_min = today - timedelta(days=365)
+            data_max = today
+        if "view_date_range" not in st.session_state:
+            st.session_state["view_date_range"] = (data_min, data_max)
 
-    st.markdown("---")
-    st.markdown(f"## Mostrando Informe: {st.session_state.get('selected_report', 'Recién Generado')}")
-    st.markdown("---")
+        with st.sidebar.expander("Filtrar visualización por fechas", expanded=False):
+            view_range = st.date_input(
+                "Rango de visualización",
+                value=st.session_state.get("view_date_range", (data_min, data_max)),
+                min_value=data_min,
+                max_value=data_max,
+                key="view_date_range"
+            )
+        if isinstance(view_range, (list, tuple)) and len(view_range) == 2:
+            view_start, view_end = view_range
+        else:
+            view_start, view_end = data_min, data_max
 
-    with st.expander("Filtrar visualización por fechas", expanded=False):
-        view_range = st.date_input(
-            "Rango de visualización (no recalcula, solo oculta periodos fuera de rango)",
-            value=st.session_state.get("view_date_range", (data_min, data_max)),
-            min_value=data_min,
-            max_value=data_max,
-            key="view_date_range"
-        )
-    if isinstance(view_range, (list, tuple)) and len(view_range) == 2:
-        view_start, view_end = view_range
-    else:
-        view_start, view_end = data_min, data_max
+        display_reports = filter_reports_by_date(base_reports, view_start, view_end)
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "Informe 1: Retención Trimestral",
+            "Informe 2: Retención Anual",
+            "Informe 3: Análisis de Supervivencia",
+            "Informe 4: Frecuencia de Compra"
+        ])
 
-    display_reports = filter_reports_by_date(base_reports, view_start, view_end)
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "Informe 1: Retención Trimestral",
-        "Informe 2: Retención Anual",
-        "Informe 3: Análisis de Supervivencia",
-        "Informe 4: Frecuencia de Compra"
-    ])
-
-    with tab1:
-        st.header("Retención por Trimestres")
-        st.markdown("""
-        **Descripción**: Análisis de cohortes que muestra qué porcentaje de clientes de cada cohorte trimestral (basada en su primera compra) realiza compras en trimestres subsiguientes.
-        - **Filas**: Cohorte (trimestre de primera compra)
-        - **Columnas**: Trimestres calendario
-        - **Valores**: % de retención
-        """)
-        with st.expander("❓ Ayuda: ¿Cómo interpretar la tabla?", expanded=False):
-            st.markdown(
-                "Cada celda indica el **porcentaje de clientes** de la cohorte (fila) que realizaron **al menos una compra** "
-                "en el periodo (columna). No es porcentaje de pedidos."
-            )
-            st.markdown(
-                "Ejemplo: si en la fila `Y2020-Q4` y la columna `Y2023-Q3` aparece `2.4%`, "
-                "significa que **el 2.4% de los clientes cuya primera compra fue en Y2020‑Q4 compraron al menos una vez en Y2023‑Q3**."
-            )
-            st.markdown(
-                "Pistas rápidas: la diagonal suele ser `100%` (primera compra) y los periodos **anteriores a la cohorte** aparecen como `0%`."
-            )
-        if display_reports.get('report1') is not None and not display_reports['report1'].empty:
-            show_table(
-                display_reports['report1'],
-                styler_fn=lambda d: style_percent_heatmap(d, cmap=RETENTION_CMAP),
-                info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
-            )
-
-    with tab2:
-        st.header("Retención Anual")
-        st.markdown("Versión agregada del análisis de retención a nivel anual.")
-        with st.expander("❓ Ayuda: ¿Cómo interpretar la tabla?", expanded=False):
-            st.markdown(
-                "Cada celda indica el **porcentaje de clientes** de la cohorte (fila) que realizaron **al menos una compra** "
-                "en el año (columna). No es porcentaje de pedidos."
-            )
-            st.markdown(
-                "Ejemplo: si en la fila `2020` y la columna `2023` aparece `2.4%`, "
-                "significa que **el 2.4% de los clientes cuya primera compra fue en 2020 compraron al menos una vez en 2023**."
-            )
-            st.markdown(
-                "Pistas rápidas: la diagonal suele ser `100%` y los años **anteriores a la cohorte** aparecen como `0%`."
-            )
-        if display_reports.get('report2') is not None and not display_reports['report2'].empty:
-             show_table(
-                 display_reports['report2'],
-                 styler_fn=lambda d: style_percent_heatmap(d, cmap=RETENTION_CMAP),
-                 info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
-             )
-
-    with tab3:
-        st.header("Análisis de Supervivencia")
-        st.markdown("""
-        **Descripción**: Porcentaje de clientes de una cohorte que permanecen "activos" (realizando compras) después de un número específico de meses desde su primera compra.
-        """)
-        if display_reports.get('report3') is not None and not display_reports['report3'].empty:
-            st.subheader("Resumen Ejecutivo")
-            if base_summary:
-                cols = st.columns(len(base_summary))
-                for i, (key, value) in enumerate(base_summary.items()):
-                    if "%" in key:
-                        cols[i].metric(key, f"{value:.2f}%")
-                    elif key.startswith("Clientes activos"):
-                        cols[i].metric(key, f"{int(value):,}")
-                    elif "días" in key or "Promedio" in key:
-                        cols[i].metric(key, f"{value:.2f}")
-                    else:
-                        cols[i].metric(key, f"{int(value):,}")
-            if base_active_window:
-                st.caption(
-                    f"Ventana usada para 'Clientes activos (últimos 90 días)': "
-                    f"{base_active_window['start']} a {base_active_window['end']}"
+        with tab1:
+            st.header("Retención por Trimestres")
+            def _help_ret_trimestral():
+                st.markdown(
+                    "Análisis de cohortes que muestra qué porcentaje de clientes de cada cohorte trimestral "
+                    "(basada en su primera compra) realiza compras en trimestres subsiguientes."
+                )
+                st.markdown(
+                    "- **Filas**: Cohorte (trimestre de primera compra)\n"
+                    "- **Columnas**: Trimestres calendario\n"
+                    "- **Valores**: % de retención"
+                )
+                st.markdown(
+                    "Cada celda indica el **porcentaje de clientes** de la cohorte (fila) que realizaron **al menos una compra** "
+                    "en el periodo (columna). No es porcentaje de pedidos."
+                )
+                st.markdown(
+                    "Ejemplo: si en la fila `Y2020-Q4` y la columna `Y2023-Q3` aparece `2.4%`, "
+                    "significa que **el 2.4% de los clientes cuya primera compra fue en Y2020‑Q4 compraron al menos una vez en Y2023‑Q3**."
+                )
+                st.markdown(
+                    "Pistas rápidas: la diagonal suele ser `100%` (primera compra) y los periodos **anteriores a la cohorte** aparecen como `0%`."
+                )
+            help_popup("❓ Ayuda", _help_ret_trimestral)
+            if display_reports.get('report1') is not None and not display_reports['report1'].empty:
+                show_table(
+                    display_reports['report1'],
+                    styler_fn=lambda d: style_percent_heatmap(d, cmap=RETENTION_CMAP),
+                    info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
                 )
 
-            st.subheader("Tabla de Supervivencia por Cohorte")
-            show_table(
-                display_reports['report3'],
-                styler_fn=lambda d: style_percent_heatmap(d, cmap=SURVIVAL_CMAP),
-                info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
-            )
+        with tab2:
+            st.header("Retención Anual")
+            def _help_ret_anual():
+                st.markdown("Versión agregada del análisis de retención a nivel anual.")
+                st.markdown(
+                    "Cada celda indica el **porcentaje de clientes** de la cohorte (fila) que realizaron **al menos una compra** "
+                    "en el año (columna). No es porcentaje de pedidos."
+                )
+                st.markdown(
+                    "Ejemplo: si en la fila `2020` y la columna `2023` aparece `2.4%`, "
+                    "significa que **el 2.4% de los clientes cuya primera compra fue en 2020 compraron al menos una vez en 2023**."
+                )
+                st.markdown(
+                    "Pistas rápidas: la diagonal suele ser `100%` y los años **anteriores a la cohorte** aparecen como `0%`."
+                )
+            help_popup("❓ Ayuda", _help_ret_anual)
+            if display_reports.get('report2') is not None and not display_reports['report2'].empty:
+                 show_table(
+                     display_reports['report2'],
+                     styler_fn=lambda d: style_percent_heatmap(d, cmap=RETENTION_CMAP),
+                     info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
+                 )
 
-    with tab4:
-        st.header("Frecuencia de Compra")
-        st.markdown("Análisis detallado del tiempo entre compras y patrones de recompra para clientes con 2 o más pedidos.")
-        
-        if display_reports and display_reports.get('report4'):
-            st.subheader("1. Distribución por Frecuencia de Compra")
-            show_table(
-                display_reports['report4']['distribucion'],
-                styler_fn=lambda d: style_heatmap(d, cmap=FREQ_DISTRIB_CMAP),
-                info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
-            )
+        with tab3:
+            st.header("Análisis de Supervivencia")
+            def _help_survival():
+                st.markdown(
+                    "**Qué mide**: la tabla muestra el porcentaje de clientes de cada cohorte que siguen "
+                    "\"vivos\" (han comprado al menos una vez) **a partir de** un número de meses desde su primera compra."
+                )
+                st.markdown(
+                    "**Cómo leerla**:\n"
+                    "- **Fila** = cohorte (trimestre de primera compra).\n"
+                    "- **Mes X** = % de clientes que **realizaron al menos una compra en o después** de X meses.\n"
+                    "- **Total Clientes** = tamaño de la cohorte."
+                )
+                st.markdown(
+                    "**Ejemplo 1**: si en `2020‑Q4` el valor en **Mes 12** es `22.76%`, significa que "
+                    "**el 22.76% de los clientes que compraron por primera vez en 2020‑Q4 hicieron "
+                    "alguna compra a partir de los 12 meses** desde su primera compra."
+                )
+                st.markdown(
+                    "**Ejemplo 2**: si en `2021‑Q2` el valor en **Mes 36** es `3.49%`, significa que "
+                    "**solo el 3.49% de esa cohorte sigue comprando al menos una vez después de 36 meses**."
+                )
+                st.markdown(
+                    "**Lectura rápida**:\n"
+                    "- Los valores deben **disminuir** a medida que aumenta el mes.\n"
+                    "- Un **0%** indica que no hay clientes de esa cohorte con compras después de ese umbral."
+                )
+                st.markdown(
+                    "**Columnas finales**:\n"
+                    "- **Lifetime_Prom**: días promedio entre primera y última compra.\n"
+                    "- **Pedidos_Prom**: pedidos promedio por cliente.\n"
+                    "- **Revenue_Prom**: ingresos promedio por cliente."
+                )
+            help_popup("❓ Ayuda", _help_survival)
+            if display_reports.get('report3') is not None and not display_reports['report3'].empty:
+                st.subheader("Resumen Ejecutivo")
+                if base_summary:
+                    cols = st.columns(len(base_summary))
+                    for i, (key, value) in enumerate(base_summary.items()):
+                        if "%" in key:
+                            cols[i].metric(key, f"{value:.2f}%")
+                        elif key.startswith("Clientes activos"):
+                            cols[i].metric(key, f"{int(value):,}")
+                        elif "días" in key or "Promedio" in key:
+                            cols[i].metric(key, f"{value:.2f}")
+                        else:
+                            cols[i].metric(key, f"{int(value):,}")
+                if base_active_window:
+                    st.caption(
+                        f"Ventana usada para 'Clientes activos (últimos 90 días)': "
+                        f"{base_active_window['start']} a {base_active_window['end']}"
+                    )
 
-            st.subheader("2. Tiempo hasta la Segunda Compra")
-            show_table(
-                display_reports['report4']['segunda_compra'],
-                styler_fn=lambda d: style_percent_heatmap(d, cmap=RETENTION_CMAP),
-                info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
-            )
-            
-            st.subheader("3. Evolución de Frecuencia por Número de Compra")
-            show_table(
-                display_reports['report4']['evolucion'],
-                styler_fn=lambda d: style_heatmap(d, cmap=FREQ_EVOL_CMAP),
-                info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
-            )
-            
-            st.subheader("4. Velocidad de Compra (Compras por Mes)")
-            show_table(
-                display_reports['report4']['velocidad'],
-                styler_fn=lambda d: style_heatmap(d, cmap=FREQ_VEL_CMAP),
-                info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
-            )
-else:
-    if mode == "Generar un nuevo informe":
-        st.info("Sube un archivo CSV para generar un nuevo informe.")
-    else: # mode == "Ver informes guardados" y no hay informes cargados
-        st.info("Selecciona un informe guardado para visualizarlo.")
+                st.subheader("Tabla de Supervivencia por Cohorte")
+                show_table(
+                    display_reports['report3'],
+                    styler_fn=lambda d: style_percent_heatmap(d, cmap=SURVIVAL_CMAP),
+                    info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
+                )
+
+        with tab4:
+            st.header("Frecuencia de Compra")
+            def _help_freq():
+                st.markdown(
+                    "**Qué analiza**: comportamiento de recompra de clientes con **2 o más pedidos**. "
+                    "Se centra en el tiempo entre compras y en la velocidad de compra."
+                )
+                st.markdown(
+                    "**Notas clave**:\n"
+                    "- Las métricas de intervalos **no cuentan pedidos**, sino **intervalos entre compras**.\n"
+                    "- En \"2ª compra\" solo entran clientes que **sí tienen** segunda compra.\n"
+                    "- En \"Evolución\" el intervalo de la compra N es el tiempo entre la compra N‑1 y N."
+                )
+                st.markdown(
+                    "**Ejemplo**: si un cliente compra el 1/01, 15/01 y 01/02, entonces:\n"
+                    "- Intervalos: 14 días y 17 días.\n"
+                    "- En \"Evolución\", el intervalo de compra 2 es 14 días y el de compra 3 es 17 días."
+                )
+                st.markdown(
+                    "**Velocidad de compra**: se calcula como `total_pedidos / (días_actividad/30)`. "
+                    "Luego se agrupa en segmentos (Muy baja, Baja, Media, etc.)."
+                )
+            help_popup("❓ Ayuda", _help_freq)
+
+            if display_reports and display_reports.get('report4'):
+                ft1, ft2, ft3, ft4 = st.tabs([
+                    "Distribución",
+                    "2ª compra",
+                    "Evolución",
+                    "Velocidad"
+                ])
+
+                with ft1:
+                    st.subheader("Distribución por Frecuencia de Compra")
+                    st.caption("Intervalos de días entre compras para clientes con 2+ pedidos.")
+                    df_dist = display_reports['report4']['distribucion']
+                    if df_dist is not None and not df_dist.empty:
+                        chart_df = df_dist[['% del Total']].copy() if '% del Total' in df_dist.columns else df_dist.copy()
+                        st.bar_chart(chart_df)
+                    show_table(
+                        df_dist,
+                        styler_fn=style_frequency_distribucion,
+                        info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
+                    )
+
+                with ft2:
+                    st.subheader("Tiempo hasta la Segunda Compra")
+                    st.caption("Clientes que vuelven a comprar según el tiempo transcurrido desde su primera compra.")
+                    df_2 = display_reports['report4']['segunda_compra']
+                    if df_2 is not None and not df_2.empty:
+                        chart_df = df_2[['% del Total']].copy() if '% del Total' in df_2.columns else df_2.copy()
+                        st.bar_chart(chart_df)
+                    show_table(
+                        df_2,
+                        styler_fn=style_frequency_second_purchase,
+                        info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
+                    )
+
+                with ft3:
+                    st.subheader("Evolución de Frecuencia por Número de Compra")
+                    st.caption("Cómo cambia el intervalo entre compras a medida que aumenta el número de pedido.")
+                    df_evo = display_reports['report4']['evolucion']
+                    if df_evo is not None and not df_evo.empty:
+                        line_cols = [c for c in ['Dias_Promedio_Intervalo', 'Dias_Mediana_Intervalo'] if c in df_evo.columns]
+                        if line_cols:
+                            st.line_chart(df_evo[line_cols])
+                    show_table(
+                        df_evo,
+                        styler_fn=style_frequency_evolucion,
+                        info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
+                    )
+
+                with ft4:
+                    st.subheader("Velocidad de Compra (Compras por Mes)")
+                    st.caption("Segmentación por compras/mes con métricas promedio por cliente.")
+                    df_vel = display_reports['report4']['velocidad']
+                    if df_vel is not None and not df_vel.empty:
+                        chart_df = df_vel[['% del Total']].copy() if '% del Total' in df_vel.columns else df_vel.copy()
+                        st.bar_chart(chart_df)
+                    show_table(
+                        df_vel,
+                        styler_fn=style_frequency_velocidad,
+                        info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
+                    )
+    else:
+        st.info("Carga un informe guardado o genera uno nuevo para visualizarlo.")
