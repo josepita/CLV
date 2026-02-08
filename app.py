@@ -634,6 +634,62 @@ def generate_frequency_report(df):
         "velocidad": velocidad_compra
     }
 
+def generate_loyalty_report(df):
+    """Genera métricas de activación, repetición e ingresos recurrentes por año."""
+    if df is None or df.empty or 'fecha_dt' not in df.columns:
+        return None
+    data = df.copy()
+    data['year'] = data['fecha_dt'].dt.year
+    if 'Num_Pedidos_Cliente' in data.columns:
+        data['Num_Pedidos_Cliente'] = pd.to_numeric(data['Num_Pedidos_Cliente'], errors='coerce')
+    if 'cliente_nuevo' in data.columns:
+        data['cliente_nuevo'] = data['cliente_nuevo'].astype(str).str.lower()
+
+    grp = data.groupby('year')
+
+    # Tasa de activación
+    if 'Num_Pedidos_Cliente' in data.columns:
+        act_num = grp.apply(lambda g: g.loc[g['Num_Pedidos_Cliente'] == 2, 'cod_cliente'].nunique())
+        act_den = grp.apply(lambda g: g.loc[g['Num_Pedidos_Cliente'] == 1, 'cod_cliente'].nunique())
+        tasa_activacion = (act_num / act_den * 100).replace([np.inf, -np.inf], np.nan)
+    else:
+        tasa_activacion = pd.Series(index=grp.size().index, dtype=float)
+
+    # Tasa de repetición
+    email_col = 'email' if 'email' in data.columns else 'cod_cliente'
+    if 'cliente_nuevo' in data.columns:
+        rep_num = grp.apply(lambda g: g.loc[g['cliente_nuevo'] == 'n', email_col].nunique())
+    else:
+        rep_num = pd.Series(index=grp.size().index, dtype=float)
+    rep_den = grp.apply(lambda g: g[email_col].nunique())
+    tasa_repeticion = (rep_num / rep_den * 100).replace([np.inf, -np.inf], np.nan)
+
+    # Tasa de ingresos de clientes recurrentes
+    if 'cliente_nuevo' in data.columns and 'Total_pagado_eur' in data.columns:
+        rev_num = grp.apply(lambda g: g.loc[g['cliente_nuevo'] == 'n', 'Total_pagado_eur'].sum())
+        rev_den = grp.apply(lambda g: g['Total_pagado_eur'].sum())
+        tasa_ingresos = (rev_num / rev_den * 100).replace([np.inf, -np.inf], np.nan)
+    else:
+        tasa_ingresos = pd.Series(index=grp.size().index, dtype=float)
+
+    # Total pedidos
+    if 'codigo' in data.columns:
+        total_pedidos = grp['codigo'].nunique()
+    else:
+        total_pedidos = grp.size()
+
+    df_activacion = pd.DataFrame({'Tasa_activacion': tasa_activacion}).sort_index()
+    df_repeticion = pd.DataFrame({'Tasa_repeticion': tasa_repeticion}).sort_index()
+    df_ingresos = pd.DataFrame({'Tasa_ingresos_recurrentes': tasa_ingresos}).sort_index()
+    df_rep_ped = pd.DataFrame({'Tasa_repeticion': tasa_repeticion, 'Total_pedidos': total_pedidos}).sort_index()
+
+    return {
+        "activacion": df_activacion,
+        "repeticion": df_repeticion,
+        "ingresos_recurrentes": df_ingresos,
+        "repeticion_pedidos": df_rep_ped
+    }
+
 
 # Las funciones para los informes 3 y 4 son más complejas y se añadirán progresivamente.
 
@@ -795,6 +851,127 @@ def style_frequency_velocidad(df):
     if '% del Total' in df.columns:
         styled = styled.background_gradient(cmap=RETENTION_CMAP, subset=['% del Total'])
     return styled
+
+def style_repetition_orders(df):
+    if df is None or df.empty:
+        return df
+    fmt = {}
+    if 'Tasa_repeticion' in df.columns:
+        fmt['Tasa_repeticion'] = "{:.2f}%"
+    if 'Total_pedidos' in df.columns:
+        fmt['Total_pedidos'] = "{:,.0f}"
+    styled = df.style.format(fmt, na_rep="-")
+    if 'Tasa_repeticion' in df.columns:
+        styled = styled.background_gradient(cmap=RETENTION_CMAP, subset=['Tasa_repeticion'])
+    return styled
+
+def plot_repetition_vs_orders(df):
+    """Grafico de doble eje: tasa de repetición (%) y total pedidos."""
+    if df is None or df.empty:
+        return None
+    if 'Tasa_repeticion' not in df.columns or 'Total_pedidos' not in df.columns:
+        return None
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+
+    years = df.index.astype(str).tolist()
+    x = np.arange(len(years))
+    width = 0.38
+    tasa = df['Tasa_repeticion'].astype(float).values
+    pedidos = df['Total_pedidos'].astype(float).values
+
+    fig, ax1 = plt.subplots(figsize=(8, 3.5))
+    ax2 = ax1.twinx()
+
+    bars1 = ax1.bar(x - width/2, tasa, width, color="#4C8BF5", label="Tasa de repetición (%)")
+    bars2 = ax2.bar(x + width/2, pedidos, width, color="#F4A261", label="Total pedidos")
+
+    ax1.set_ylabel("% repetición")
+    ax2.set_ylabel("Total pedidos")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(years)
+    ax1.set_ylim(0, max(100, np.nanmax(tasa) * 1.2 if len(tasa) else 100))
+    ax1.grid(axis="y", linestyle="--", alpha=0.3)
+
+    # Etiquetas de valores
+    for b in bars1:
+        val = b.get_height()
+        ax1.annotate(
+            f"{val:.2f}%",
+            xy=(b.get_x() + b.get_width()/2, val),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#1F3B75",
+        )
+    for b in bars2:
+        val = b.get_height()
+        ax2.annotate(
+            f"{val:,.0f}",
+            xy=(b.get_x() + b.get_width()/2, val),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#7A3E00",
+        )
+
+    # Leyenda combinada
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="upper left", frameon=False)
+
+    fig.tight_layout()
+    return fig
+
+def plot_bar_with_labels(df, y_col, color="#4C8BF5", is_percent=True):
+    """Gráfico de barras con etiquetas de valor encima."""
+    if df is None or df.empty or y_col not in df.columns:
+        return None
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+
+    years = df.index.astype(str).tolist()
+    x = np.arange(len(years))
+    values = pd.to_numeric(df[y_col], errors="coerce").values
+
+    fig, ax = plt.subplots(figsize=(8, 3.5))
+    bars = ax.bar(x, values, color=color)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(years)
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    if is_percent:
+        ax.set_ylim(0, max(100, np.nanmax(values) * 1.2 if len(values) else 100))
+        ax.set_ylabel("%")
+    else:
+        ax.set_ylabel("Valor")
+
+    for b in bars:
+        val = b.get_height()
+        if pd.isna(val):
+            continue
+        label = f"{val:.2f}%" if is_percent else f"{val:,.0f}"
+        ax.annotate(
+            label,
+            xy=(b.get_x() + b.get_width()/2, val),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#1F3B75",
+        )
+
+    fig.tight_layout()
+    return fig
 
 def style_survival_table(df):
     """Estilos para tabla de supervivencia: % en Meses, días/pedidos/revenue en columnas finales."""
@@ -1006,6 +1183,14 @@ def filter_reports_by_date(reports, start_date, end_date):
         df_copy = df_copy.loc[:, col_keep]
         return df_copy
 
+    def filter_year_table(df):
+        if df is None or df.empty:
+            return df
+        df_copy = df.copy()
+        years = pd.to_numeric(df_copy.index, errors="coerce")
+        mask = (years >= start_ts.year) & (years <= end_ts.year)
+        return df_copy.loc[mask]
+
     filtered = {}
     filtered['report1'] = filter_period_table(reports['report1'], 'Q') if 'report1' in reports else None
     filtered['report2'] = filter_period_table(reports['report2'], 'Y') if 'report2' in reports else None
@@ -1019,6 +1204,16 @@ def filter_reports_by_date(reports, start_date, end_date):
     else:
         filtered['report3'] = None
     filtered['report4'] = reports.get('report4')
+    if 'report5' in reports and reports['report5'] is not None:
+        r5 = reports['report5']
+        filtered['report5'] = {
+            "activacion": filter_year_table(r5.get('activacion')),
+            "repeticion": filter_year_table(r5.get('repeticion')),
+            "ingresos_recurrentes": filter_year_table(r5.get('ingresos_recurrentes')),
+            "repeticion_pedidos": filter_year_table(r5.get('repeticion_pedidos')),
+        }
+    else:
+        filtered['report5'] = None
     return filtered
 
 from openpyxl.styles import PatternFill, Font
@@ -1037,6 +1232,18 @@ def export_to_excel(reports):
         reports['report4']['segunda_compra'].to_excel(writer, sheet_name='Frecuencia - 2da Compra')
         reports['report4']['evolucion'].to_excel(writer, sheet_name='Frecuencia - Evolución')
         reports['report4']['velocidad'].to_excel(writer, sheet_name='Frecuencia - Velocidad')
+
+        # Informes de lealtad (frecuencia y recurrencia)
+        if reports.get('report5'):
+            r5 = reports['report5']
+            if r5.get('activacion') is not None:
+                r5['activacion'].to_excel(writer, sheet_name='Lealtad - Activación')
+            if r5.get('repeticion') is not None:
+                r5['repeticion'].to_excel(writer, sheet_name='Lealtad - Repetición')
+            if r5.get('ingresos_recurrentes') is not None:
+                r5['ingresos_recurrentes'].to_excel(writer, sheet_name='Lealtad - Ingresos Recurrentes')
+            if r5.get('repeticion_pedidos') is not None:
+                r5['repeticion_pedidos'].to_excel(writer, sheet_name='Lealtad - Repetición vs Pedidos')
 
         # --- Aplicar Estilos (Ejemplo para Retención Trimestral) ---
         # Definir rellenos de color
@@ -1258,12 +1465,14 @@ if mode == "Generar informe":
                         report2_df = generate_annual_retention_report(df_processed)
                         report3_df, report3_summary, report3_active_window = generate_survival_analysis(df_processed)
                         report4_dfs = generate_frequency_report(df_processed)
+                        report5_dfs = generate_loyalty_report(df_processed)
 
                         all_reports = {
                             "report1": report1_df,
                             "report2": report2_df,
                             "report3": report3_df,
                             "report4": report4_dfs,
+                            "report5": report5_dfs,
                         }
                         excel_file = export_to_excel(all_reports) # Se devuelve el io.BytesIO
                         excel_bytes = excel_file.getvalue()
@@ -1395,6 +1604,13 @@ elif mode == "Informes guardados":
                                     "segunda_compra": all_reports_from_excel.get('Frecuencia - 2da Compra'),
                                     "evolucion": all_reports_from_excel.get('Frecuencia - Evolución'),
                                     "velocidad": all_reports_from_excel.get('Frecuencia - Velocidad'),
+                                }
+                                ,
+                                "report5": {
+                                    "activacion": all_reports_from_excel.get('Lealtad - Activación'),
+                                    "repeticion": all_reports_from_excel.get('Lealtad - Repetición'),
+                                    "ingresos_recurrentes": all_reports_from_excel.get('Lealtad - Ingresos Recurrentes'),
+                                    "repeticion_pedidos": all_reports_from_excel.get('Lealtad - Repetición vs Pedidos'),
                                 }
                             }
                             if loaded_reports.get("report3") is not None and 'Total Clientes' in loaded_reports["report3"].columns:
@@ -1772,7 +1988,81 @@ if mode == "Ver informe":
                     "**Velocidad de compra**: se calcula como `total_pedidos / (días_actividad/30)`. "
                     "Luego se agrupa en segmentos (Muy baja, Baja, Media, etc.)."
                 )
+                st.markdown(
+                    "**Frecuencia y Recurrencia (Lealtad)**:\n"
+                    "- **Tasa de activación** = `COUNT_DISTINCT(IF(Num_Pedidos_Cliente = 2, cod_cliente)) / "
+                    "COUNT_DISTINCT(IF(Num_Pedidos_Cliente = 1, cod_cliente))`\n"
+                    "- **Tasa de repetición** = `COUNT_DISTINCT(CASE WHEN cliente_nuevo = \"n\" THEN email END) / "
+                    "COUNT_DISTINCT(email)`\n"
+                    "- **Tasa ingresos recurrentes** = `SUM(IF(cliente_nuevo = \"n\", Total_pagado, 0)) / SUM(Total_pagado)`\n"
+                    "- **Total pedidos** = `COUNT_DISTINCT(codigo)`\n\n"
+                    "Se calcula **por año de la fecha del pedido** y respeta el rango de fechas procesado."
+                )
             help_popup("❓ Ayuda", _help_freq)
+
+            if display_reports and display_reports.get('report5'):
+                st.subheader("Frecuencia y Recurrencia (Lealtad)")
+                r5 = display_reports['report5']
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Tasa de activación**")
+                    df_act = r5.get('activacion')
+                    if df_act is not None and not df_act.empty:
+                        fig = plot_bar_with_labels(df_act, "Tasa_activacion", color="#4C8BF5", is_percent=True)
+                        if fig is not None:
+                            st.pyplot(fig, clear_figure=True)
+                        else:
+                            st.bar_chart(df_act)
+                    show_table(
+                        df_act,
+                        styler_fn=style_percent_heatmap,
+                        info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
+                    )
+                with col2:
+                    st.markdown("**Tasa de repetición**")
+                    df_rep = r5.get('repeticion')
+                    if df_rep is not None and not df_rep.empty:
+                        fig = plot_bar_with_labels(df_rep, "Tasa_repeticion", color="#4C8BF5", is_percent=True)
+                        if fig is not None:
+                            st.pyplot(fig, clear_figure=True)
+                        else:
+                            st.bar_chart(df_rep)
+                    show_table(
+                        df_rep,
+                        styler_fn=style_percent_heatmap,
+                        info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
+                    )
+
+                col3, col4 = st.columns(2)
+                with col3:
+                    st.markdown("**Tasa de ingresos de clientes recurrentes**")
+                    df_rev = r5.get('ingresos_recurrentes')
+                    if df_rev is not None and not df_rev.empty:
+                        fig = plot_bar_with_labels(df_rev, "Tasa_ingresos_recurrentes", color="#4C8BF5", is_percent=True)
+                        if fig is not None:
+                            st.pyplot(fig, clear_figure=True)
+                        else:
+                            st.bar_chart(df_rev)
+                    show_table(
+                        df_rev,
+                        styler_fn=style_percent_heatmap,
+                        info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
+                    )
+                with col4:
+                    st.markdown("**Tasa de repetición y total pedidos**")
+                    df_rep_ped = r5.get('repeticion_pedidos')
+                    if df_rep_ped is not None and not df_rep_ped.empty:
+                        fig = plot_repetition_vs_orders(df_rep_ped)
+                        if fig is not None:
+                            st.pyplot(fig, clear_figure=True)
+                        else:
+                            st.bar_chart(df_rep_ped)
+                    show_table(
+                        df_rep_ped,
+                        styler_fn=style_repetition_orders,
+                        info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
+                    )
 
             if display_reports and display_reports.get('report4'):
                 ft1, ft2, ft3, ft4 = st.tabs([
