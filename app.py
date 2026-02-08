@@ -82,7 +82,7 @@ def detect_dayfirst(strings: pd.Series) -> bool:
     if strings.empty:
         return True
     s = strings.astype(str).str.strip()
-    mask = s.str.match(r"^\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}$")
+    mask = s.str.match(r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$")
     if not mask.any():
         return True
     parts = s[mask].str.replace("-", "/", regex=False).str.split("/")
@@ -120,8 +120,8 @@ def parse_date_series(series: pd.Series, mode: str = "auto", logger=None) -> pd.
 
     s = series.copy()
     str_s = s.astype(str).str.strip()
-    iso_mask = str_s.str.match(r"^\\d{4}[-/]\\d{1,2}[-/]\\d{1,2}$")
-    yyyymmdd_mask = str_s.str.match(r"^\\d{8}$")
+    iso_mask = str_s.str.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}$")
+    yyyymmdd_mask = str_s.str.match(r"^\d{8}$")
 
     def parse_excel(numeric, origin):
         base = pd.Timestamp("1899-12-30") if origin == "1900" else pd.Timestamp("1904-01-01")
