@@ -116,11 +116,12 @@ def load_users_config():
             users_raw = None
     if users_raw is None and env_json:
         users_raw = env_json
-    try:
-        if "users" in st.secrets:
-            users_raw = st.secrets["users"]
-    except Exception:
-        users_raw = None
+    if users_raw is None:
+        try:
+            if "users" in st.secrets:
+                users_raw = st.secrets["users"]
+        except Exception:
+            users_raw = None
     if users_raw is None and os.path.exists(USERS_FILE):
         with open(USERS_FILE, "r", encoding="utf-8") as f:
             try:
@@ -156,6 +157,16 @@ def require_auth():
                 diagnostics.append("CLV_USERS_JSON presente y válido.")
             except Exception:
                 diagnostics.append("CLV_USERS_JSON presente pero inválido (JSON).")
+        try:
+            if "users" in st.secrets:
+                secrets_val = st.secrets["users"]
+                try:
+                    _normalize_users(secrets_val)
+                    diagnostics.append("st.secrets['users'] presente.")
+                except Exception:
+                    diagnostics.append("st.secrets['users'] presente pero inválido.")
+        except Exception:
+            pass
 
         st.error(
             "No hay usuarios configurados. Configura `CLV_USERS_JSON` o `CLV_USERS_B64`, "
