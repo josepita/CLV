@@ -7,7 +7,8 @@ import os
 import json
 
 # --- Configuración de persistencia de informes ---
-REPORTS_DIR = "reports"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 REPORTS_INDEX_FILE = os.path.join(REPORTS_DIR, "reports_index.json")
 
 def load_reports_index():
@@ -30,6 +31,25 @@ def get_report_filepath(report_name_base):
     safe_name = "".join(c if c.isalnum() else "_" for c in report_name_base).lower()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return os.path.join(REPORTS_DIR, f"{safe_name}_{timestamp}.xlsx")
+
+def make_json_safe(obj):
+    """Convierte tipos numpy/pandas a tipos JSON serializables."""
+    if isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [make_json_safe(v) for v in obj]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, (pd.Timestamp, datetime)):
+        return obj.isoformat()
+    return obj
+
+def safe_rerun():
+    """Compatibilidad con versiones de Streamlit antiguas y nuevas."""
+    if hasattr(st, "rerun"):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
 
 # --- Funciones de Cálculo de Informes (a implementar) ---
 
@@ -539,6 +559,16 @@ if "df_raw" not in st.session_state: # Inicializar df_raw también
     st.session_state["df_raw"] = None
 if "selected_report" not in st.session_state: # Para almacenar el nombre del informe cargado/generado
     st.session_state["selected_report"] = None
+if "last_generated_excel_bytes" not in st.session_state:
+    st.session_state["last_generated_excel_bytes"] = None
+if "last_generated_reports" not in st.session_state:
+    st.session_state["last_generated_reports"] = None
+if "last_generated_summary" not in st.session_state:
+    st.session_state["last_generated_summary"] = None
+if "last_generated_range" not in st.session_state:
+    st.session_state["last_generated_range"] = None
+if "delete_candidate" not in st.session_state:
+    st.session_state["delete_candidate"] = None
 
 preview_placeholder = st.empty()
 status_placeholder = st.empty()
@@ -653,44 +683,12 @@ if mode == "Generar un nuevo informe":
                             "report4": report4_dfs,
                         }
                         excel_file = export_to_excel(all_reports) # Se devuelve el io.BytesIO
-
-                        # --- Ahora se añade la opción de guardar el informe generado ---
-                        st.subheader("Guardar Informe Generado")
-                        report_name_input = st.text_input("Introduce un nombre para guardar este informe:", 
-                                                     value=f"Informe CLV {datetime.now().strftime('%Y%m%d_%H%M')}",
-                                                     key="save_report_name_input")
-                        
-                        if st.button("💾 Guardar Informe", key="save_report_button"):
-                            if report_name_input:
-                                reports_index = load_reports_index()
-                                if report_name_input in reports_index:
-                                    st.warning(f"Ya existe un informe con el nombre '{report_name_input}'. Por favor, elige otro nombre.")
-                                else:
-                                    report_filepath = get_report_filepath(report_name_input)
-                                    with open(report_filepath, "wb") as f:
-                                        f.write(excel_file.getvalue()) # Guardar los bytes del Excel en el archivo
-
-                                    reports_index[report_name_input] = {
-                                        "filename": os.path.basename(report_filepath),
-                                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                        "date_min": date_start.isoformat(),
-                                        "date_max": date_end.isoformat(),
-                                        "summary": report3_summary # Guardar el resumen también si es útil
-                                    }
-                                    save_reports_index(reports_index)
-                                    st.success(f"Informe '{report_name_input}' guardado exitosamente.")
-                                    st.session_state["save_report_name_input"] = f"Informe CLV {datetime.now().strftime('%Y%m%d_%H%M')}" # Resetear input
-                                    st.session_state["base_reports"] = all_reports # Cargar en la vista principal
-                                    st.session_state["base_summary"] = report3_summary
-                                    st.session_state["selected_report"] = report_name_input # Marcar como seleccionado
-                                    st.experimental_rerun() # Recargar para mostrar el informe
-                            else:
-                                st.warning("Por favor, introduce un nombre para el informe.")
+                        excel_bytes = excel_file.getvalue()
 
                         st.session_state["history"].insert(0, {
                             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
                             "reports": all_reports,
-                            "excel_bytes": excel_file.getvalue(),
+                            "excel_bytes": excel_bytes,
                             "summary": report3_summary
                         })
                         # Guardar como base para vista y rango por defecto para la sesión
@@ -701,6 +699,13 @@ if mode == "Generar un nuevo informe":
                         st.session_state["data_date_max"] = df_processed['fecha_dt'].max().date()
                         st.session_state["view_date_range"] = (st.session_state["data_date_min"], st.session_state["data_date_max"])
 
+                        # Persistir último informe generado para poder guardarlo en un rerun
+                        st.session_state["last_generated_excel_bytes"] = excel_bytes
+                        st.session_state["last_generated_reports"] = all_reports
+                        st.session_state["last_generated_summary"] = report3_summary
+                        st.session_state["last_generated_range"] = (date_start, date_end)
+                        st.session_state["save_report_name_input"] = f"Informe CLV {datetime.now().strftime('%Y%m%d_%H%M')}"
+
                         # Limpiar vista previa y logs;
                         log_box.empty()
                         preview_placeholder.empty()
@@ -708,7 +713,7 @@ if mode == "Generar un nuevo informe":
 
                         st.sidebar.download_button(
                             label="📥 Descargar Informes en Excel (sesión actual)",
-                            data=excel_file,
+                            data=excel_bytes,
                             file_name=f"Analisis_CLV_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key="download_latest_session"
@@ -719,6 +724,41 @@ if mode == "Generar un nuevo informe":
             st.error("El archivo CSV subido está vacío. Por favor, sube un archivo con datos.")
         elif uploaded_file is None:
             st.info("Sube un archivo CSV para comenzar el análisis.")
+
+    # --- Guardar informe (persistente) fuera del botón de generación ---
+    if st.session_state.get("last_generated_excel_bytes"):
+        st.subheader("Guardar Informe Generado")
+        report_name_input = st.text_input(
+            "Introduce un nombre para guardar este informe:",
+            value=st.session_state.get("save_report_name_input", f"Informe CLV {datetime.now().strftime('%Y%m%d_%H%M')}"),
+            key="save_report_name_input"
+        )
+
+        if st.button("💾 Guardar Informe", key="save_report_button"):
+            if report_name_input:
+                reports_index = load_reports_index()
+                if report_name_input in reports_index:
+                    st.warning(f"Ya existe un informe con el nombre '{report_name_input}'. Por favor, elige otro nombre.")
+                else:
+                    report_filepath = get_report_filepath(report_name_input)
+                    with open(report_filepath, "wb") as f:
+                        f.write(st.session_state["last_generated_excel_bytes"])
+
+                    date_start, date_end = st.session_state.get("last_generated_range", (None, None))
+                    json_safe_summary = make_json_safe(st.session_state.get("last_generated_summary", {}))
+                    reports_index[report_name_input] = {
+                        "filename": os.path.basename(report_filepath),
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "date_min": date_start.isoformat() if date_start else "",
+                        "date_max": date_end.isoformat() if date_end else "",
+                        "summary": json_safe_summary
+                    }
+                    save_reports_index(reports_index)
+                    st.success(f"Informe '{report_name_input}' guardado exitosamente.")
+                    st.session_state["selected_report"] = report_name_input
+                    safe_rerun()
+            else:
+                st.warning("Por favor, introduce un nombre para el informe.")
 
 
 
@@ -780,7 +820,7 @@ elif mode == "Ver informes guardados":
                             st.session_state["view_date_range"] = (st.session_state["data_date_min"], st.session_state["data_date_max"])
                             st.session_state["selected_report"] = selected_report_name
                             st.success(f"Informe '{selected_report_name}' cargado para visualización.")
-                            st.experimental_rerun() # Recargar para mostrar el informe
+                            safe_rerun() # Recargar para mostrar el informe
                         else:
                             st.error(f"Archivo de informe '{selected_report_data['filename']}' no encontrado.")
                     except Exception as e:
@@ -803,22 +843,34 @@ elif mode == "Ver informes guardados":
                     st.warning("Archivo Excel no encontrado, solo se puede eliminar el registro.")
 
                 if st.button(f"🗑️ Eliminar '{selected_report_name}'", key="delete_selected_report"):
-                    if st.confirm(f"¿Estás seguro de que quieres eliminar el informe '{selected_report_name}' y su archivo asociado?", key="confirm_delete"):
-                        try:
-                            # Eliminar archivo Excel
-                            report_filepath = os.path.join(REPORTS_DIR, selected_report_data['filename'])
-                            if os.path.exists(report_filepath):
-                                os.remove(report_filepath)
-                            
-                            # Eliminar de reports_index
-                            del reports_index[selected_report_name]
-                            save_reports_index(reports_index)
-                            st.success(f"Informe '{selected_report_name}' eliminado exitosamente.")
-                            st.session_state["selected_report"] = None # Resetear selección
-                            st.session_state["base_reports"] = None # Limpiar la vista actual si era el informe eliminado
-                            st.experimental_rerun() # Volver a cargar la página para actualizar la lista
-                        except Exception as e:
-                            st.error(f"Error al eliminar el informe '{selected_report_name}': {e}")
+                    st.session_state["delete_candidate"] = selected_report_name
+
+                if st.session_state.get("delete_candidate") == selected_report_name:
+                    st.warning(
+                        f"¿Confirmas eliminar el informe '{selected_report_name}' y su archivo asociado?"
+                    )
+                    del_col1, del_col2 = st.columns(2)
+                    with del_col1:
+                        if st.button("Confirmar eliminación", key="confirm_delete"):
+                            try:
+                                # Eliminar archivo Excel
+                                report_filepath = os.path.join(REPORTS_DIR, selected_report_data['filename'])
+                                if os.path.exists(report_filepath):
+                                    os.remove(report_filepath)
+                                
+                                # Eliminar de reports_index
+                                del reports_index[selected_report_name]
+                                save_reports_index(reports_index)
+                                st.success(f"Informe '{selected_report_name}' eliminado exitosamente.")
+                                st.session_state["selected_report"] = None # Resetear selección
+                                st.session_state["base_reports"] = None # Limpiar la vista actual si era el informe eliminado
+                                st.session_state["delete_candidate"] = None
+                                safe_rerun() # Volver a cargar la página para actualizar la lista
+                            except Exception as e:
+                                st.error(f"Error al eliminar el informe '{selected_report_name}': {e}")
+                    with del_col2:
+                        if st.button("Cancelar", key="cancel_delete"):
+                            st.session_state["delete_candidate"] = None
 
 
 # --- Visualización de los informes (común a ambos modos si base_reports está seteado) ---
