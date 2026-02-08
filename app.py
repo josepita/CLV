@@ -6,11 +6,14 @@ import io
 import os
 import json
 import re
+import hashlib
+import base64
 
 # --- Configuración de persistencia de informes ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 REPORTS_INDEX_FILE = os.path.join(REPORTS_DIR, "reports_index.json")
+USERS_FILE = os.path.join(BASE_DIR, "users.json")
 
 # --- Configuración de fechas ---
 DATE_MIN_ALLOWED = datetime(2000, 1, 1)
@@ -74,6 +77,93 @@ def help_popup(title, render_fn):
     else:
         with st.expander(title, expanded=False):
             render_fn()
+
+# --- Control de acceso ---
+def hash_password(password: str, salt: str) -> str:
+    return hashlib.sha256(f"{salt}{password}".encode("utf-8")).hexdigest()
+
+def _normalize_users(users_raw):
+    if users_raw is None:
+        return {}
+    if isinstance(users_raw, str):
+        try:
+            users_raw = json.loads(users_raw)
+        except Exception:
+            return {}
+    if not isinstance(users_raw, dict):
+        return {}
+    # Permite formato {"users": {...}} o directamente {user: {salt, hash}}
+    if "users" in users_raw and isinstance(users_raw["users"], dict):
+        users_raw = users_raw["users"]
+    users = {}
+    for username, data in users_raw.items():
+        if isinstance(data, dict) and "salt" in data and "hash" in data:
+            users[username] = {"salt": str(data["salt"]), "hash": str(data["hash"])}
+        elif isinstance(data, str):
+            # Hash directo sin salt (no recomendado, pero soportado)
+            users[username] = {"salt": "", "hash": data}
+    return users
+
+def load_users_config():
+    users_raw = None
+    env_b64 = os.getenv("CLV_USERS_B64")
+    env_json = os.getenv("CLV_USERS_JSON")
+    if env_b64:
+        try:
+            decoded = base64.b64decode(env_b64).decode("utf-8")
+            users_raw = decoded
+        except Exception:
+            users_raw = None
+    if users_raw is None and env_json:
+        users_raw = env_json
+    try:
+        if "users" in st.secrets:
+            users_raw = st.secrets["users"]
+    except Exception:
+        users_raw = None
+    if users_raw is None and os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            try:
+                users_raw = json.load(f)
+            except json.JSONDecodeError:
+                users_raw = None
+    return _normalize_users(users_raw)
+
+def verify_user(username: str, password: str, users: dict) -> bool:
+    if username not in users:
+        return False
+    entry = users[username]
+    salt = entry.get("salt", "")
+    expected = entry.get("hash", "")
+    return hash_password(password, salt) == expected
+
+def require_auth():
+    users = load_users_config()
+    if not users:
+        st.error("No hay usuarios configurados. Configura `st.secrets['users']` o un archivo `users.json`.")
+        st.markdown("Ejemplo de `users.json`:")
+        st.code('{\n  \"users\": {\n    \"admin\": {\"salt\": \"SALT\", \"hash\": \"SHA256\"}\n  }\n}', language="json")
+        st.stop()
+
+    if st.session_state.get("auth_user"):
+        st.sidebar.success(f"Sesión: {st.session_state['auth_user']}")
+        if st.sidebar.button("Cerrar sesión"):
+            st.session_state["auth_user"] = None
+            safe_rerun()
+        return
+
+    with st.sidebar.form("login_form"):
+        st.markdown("### Acceso")
+        username = st.text_input("Usuario")
+        password = st.text_input("Clave", type="password")
+        submitted = st.form_submit_button("Entrar")
+        if submitted:
+            if verify_user(username, password, users):
+                st.session_state["auth_user"] = username
+                safe_rerun()
+            else:
+                st.error("Usuario o clave incorrectos.")
+    st.stop()
 
 # --- Funciones de Cálculo de Informes (a implementar) ---
 
@@ -990,9 +1080,14 @@ if "delete_candidate" not in st.session_state:
     st.session_state["delete_candidate"] = None
 if "nav_to" not in st.session_state:
     st.session_state["nav_to"] = None
+if "auth_user" not in st.session_state:
+    st.session_state["auth_user"] = None
 
 preview_placeholder = st.empty()
 status_placeholder = st.empty()
+
+# Control de acceso (bloquea el resto de la app hasta autenticación)
+require_auth()
 
 # Navegación principal
 st.sidebar.markdown("---")
@@ -1072,18 +1167,38 @@ if mode == "Generar informe":
                 min_fecha = datetime.now() - timedelta(days=365)
                 max_fecha = datetime.now()
             st.markdown("#### Rango de fechas para procesar")
-            date_range = st.date_input(
-                "Rango (desde / hasta)",
-                value=(min_fecha.date(), max_fecha.date()),
-                min_value=min_fecha.date(),
-                max_value=max_fecha.date(),
-                key="process_date_range"
+            range_mode = st.radio(
+                "Modo de rango",
+                ["Calendario", "Por años"],
+                horizontal=True,
+                key="process_date_range_mode"
             )
-            if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-                date_start, date_end = date_range
+            if range_mode == "Por años":
+                years = list(range(min_fecha.year, max_fecha.year + 1))
+                if not years:
+                    years = [datetime.now().year]
+                col_y1, col_y2 = st.columns(2)
+                start_year = col_y1.selectbox("Año inicio", years, index=0, key="process_start_year")
+                end_year = col_y2.selectbox("Año fin", years, index=len(years) - 1, key="process_end_year")
+                if start_year > end_year:
+                    st.warning("El año de inicio no puede ser mayor que el año fin. Se ajustó automáticamente.")
+                    start_year, end_year = end_year, start_year
+                date_start = datetime(start_year, 1, 1).date()
+                date_end = datetime(end_year, 12, 31).date()
+                st.caption(f"Se analizará desde {date_start} hasta {date_end}.")
             else:
-                date_start = min_fecha.date()
-                date_end = max_fecha.date()
+                date_range = st.date_input(
+                    "Rango (desde / hasta)",
+                    value=(min_fecha.date(), max_fecha.date()),
+                    min_value=min_fecha.date(),
+                    max_value=max_fecha.date(),
+                    key="process_date_range"
+                )
+                if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+                    date_start, date_end = date_range
+                else:
+                    date_start = min_fecha.date()
+                    date_end = max_fecha.date()
 
             if st.button("Generar / Actualizar Informes", key="generate_button_main"):
                 log_box = status_placeholder.empty()
@@ -1448,13 +1563,32 @@ if mode == "Ver informe":
         st.session_state["view_date_range"] = (view_start, view_end)
 
         with st.sidebar.expander("Filtrar visualización por fechas", expanded=False):
-            view_range = st.date_input(
-                "Rango de visualización",
-                value=st.session_state.get("view_date_range", (data_min, data_max)),
-                min_value=data_min,
-                max_value=data_max,
-                key="view_date_range"
+            view_range_mode = st.radio(
+                "Modo de rango",
+                ["Calendario", "Por años"],
+                horizontal=True,
+                key="view_date_range_mode"
             )
+            if view_range_mode == "Por años":
+                years = list(range(data_min.year, data_max.year + 1))
+                if not years:
+                    years = [datetime.now().year]
+                col_y1, col_y2 = st.columns(2)
+                start_year = col_y1.selectbox("Año inicio", years, index=0, key="view_start_year")
+                end_year = col_y2.selectbox("Año fin", years, index=len(years) - 1, key="view_end_year")
+                if start_year > end_year:
+                    st.warning("El año de inicio no puede ser mayor que el año fin. Se ajustó automáticamente.")
+                    start_year, end_year = end_year, start_year
+                view_range = (datetime(start_year, 1, 1).date(), datetime(end_year, 12, 31).date())
+                st.caption(f"Mostrando desde {view_range[0]} hasta {view_range[1]}.")
+            else:
+                view_range = st.date_input(
+                    "Rango de visualización",
+                    value=st.session_state.get("view_date_range", (data_min, data_max)),
+                    min_value=data_min,
+                    max_value=data_max,
+                    key="view_date_range"
+                )
         if isinstance(view_range, (list, tuple)) and len(view_range) == 2:
             view_start, view_end = view_range
         else:
