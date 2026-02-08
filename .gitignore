@@ -3,3 +3,5 @@ promt.md
 data/*.csv
 __pycache__/
 *.pyc
+reports/*
+!reports/.gitkeep
