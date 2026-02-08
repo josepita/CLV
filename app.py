@@ -200,7 +200,33 @@ def parse_date_series(series: pd.Series, mode: str = "auto", logger=None) -> pd.
     result.loc[~iso_mask] = pd.to_datetime(str_s[~iso_mask], errors="coerce", dayfirst=dayfirst)
     return result
 
-def preprocess_data(df, logger=st.write, date_mode="auto"):
+def detect_amount_divisor(series: pd.Series, mode: str = "auto", logger=None) -> int:
+    """Detecta si Total_pagado está en euros o céntimos para aplicar divisor."""
+    if logger is None:
+        logger = lambda *args, **kwargs: None
+    if mode == "eur":
+        logger("Total_pagado forzado: euros (divisor 1).")
+        return 1
+    if mode == "cents":
+        logger("Total_pagado forzado: céntimos (divisor 100).")
+        return 100
+    numeric = pd.to_numeric(series, errors="coerce")
+    numeric_nonnull = numeric[numeric.notna()]
+    if numeric_nonnull.empty:
+        return 1
+    frac_ratio = ((numeric_nonnull % 1).abs() > 1e-6).mean()
+    median_val = numeric_nonnull.median()
+    max_val = numeric_nonnull.max()
+    if frac_ratio > 0.3:
+        logger("Total_pagado detectado con decimales: asumiendo euros (divisor 1).")
+        return 1
+    if median_val >= 1000 or max_val >= 100000:
+        logger("Total_pagado detectado como valores altos: asumiendo céntimos (divisor 100).")
+        return 100
+    logger("Total_pagado detectado como valores moderados: asumiendo euros (divisor 1).")
+    return 1
+
+def preprocess_data(df, logger=st.write, date_mode="auto", amount_mode="auto"):
     """Limpia y preprocesa el DataFrame."""
     logger("Iniciando preprocesamiento de datos...")
     
@@ -243,7 +269,9 @@ def preprocess_data(df, logger=st.write, date_mode="auto"):
     df = df.sort_values('fecha_dt')
 
     # Conversión de total pagado
-    df['Total_pagado_eur'] = pd.to_numeric(df['Total_pagado'], errors='coerce') / 100
+    total_numeric = pd.to_numeric(df['Total_pagado'], errors='coerce')
+    divisor = detect_amount_divisor(df['Total_pagado'], mode=amount_mode, logger=logger)
+    df['Total_pagado_eur'] = total_numeric / divisor
     df = df.dropna(subset=['Total_pagado_eur'])
     logger(f"Filas después de limpiar importes: {len(df):,}")
 
@@ -487,40 +515,46 @@ def generate_frequency_report(df):
 
 def style_retention_table(df):
     """Aplica estilos de color a la tabla de retención."""
-    def color_cells(val, row_idx, col_idx, df_values):
-        cohorte_period = df_values.index[row_idx]
-        current_period = df_values.columns[col_idx]
-        
-        # Convertir 'Y2024-Q1' a un objeto Period
-        try:
-            cohorte_period = pd.Period(cohorte_period.replace('Y', ''), freq='Q')
-            current_period = pd.Period(current_period.replace('Y', ''), freq='Q')
-        except:
-             return '' # No aplicar estilo si el formato no es el esperado
+    if df is None or df.empty:
+        return df
 
-        style = ''
-        if pd.isna(val) or val == 0:
-            style = 'background-color: #C0C0C0' # Gris
-        elif current_period < cohorte_period:
-             style = 'background-color: #C0C0C0' # Gris
-        elif current_period == cohorte_period:
-            style = 'background-color: #1E6B1E; color: white' # Verde oscuro
-        elif val >= 8:
-            style = 'background-color: #7CCD7C' # Verde claro
-        elif 3 <= val < 8:
-            style = 'background-color: #FFD700' # Amarillo
-        else:
-            style = 'background-color: #FF6B6B' # Rojo
-        return style
+    def build_styles(data):
+        styles = pd.DataFrame("", index=data.index, columns=data.columns)
+        if len(data.columns) <= 1:
+            return styles
+        for i, row_label in enumerate(data.index):
+            for j, col_label in enumerate(data.columns[1:], start=1):
+                val = data.iloc[i, j]
+                # Convertir 'Y2024-Q1' a un objeto Period
+                try:
+                    cohorte_period = pd.Period(str(row_label).replace('Y', ''), freq='Q')
+                    current_period = pd.Period(str(col_label).replace('Y', ''), freq='Q')
+                except Exception:
+                    continue
 
-    styled = df.style.format("{:.2f}%", na_rep="").apply(
-        lambda r: [
-            color_cells(r.iloc[c_idx], r.name, c_idx, r.to_frame().T)
-            for c_idx in range(len(r))
-        ],
-        axis=1,
-        subset=pd.IndexSlice[:, df.columns[1:]] # No aplicar a la columna 'Total Clientes'
-    ).format({'Total Clientes': "{:,.0f}"})
+                if pd.isna(val) or val == 0 or current_period < cohorte_period:
+                    styles.iloc[i, j] = 'background-color: #C0C0C0' # Gris
+                elif current_period == cohorte_period:
+                    styles.iloc[i, j] = 'background-color: #1E6B1E; color: white' # Verde oscuro
+                elif val >= 8:
+                    styles.iloc[i, j] = 'background-color: #7CCD7C' # Verde claro
+                elif 3 <= val < 8:
+                    styles.iloc[i, j] = 'background-color: #FFD700' # Amarillo
+                else:
+                    styles.iloc[i, j] = 'background-color: #FF6B6B' # Rojo
+        return styles
+
+    first_col = df.columns[0] if len(df.columns) else None
+    fmt = {}
+    if first_col:
+        fmt[first_col] = "{:,.0f}"
+    for col in df.columns[1:]:
+        fmt[col] = "{:.2f}%"
+
+    styled = df.style.format(fmt, na_rep="").apply(
+        build_styles,
+        axis=None
+    )
     return styled
 
 def style_heatmap(df, cmap="Greens"):
@@ -528,7 +562,12 @@ def style_heatmap(df, cmap="Greens"):
     if df is None or df.empty:
         return df
     first_col = df.columns[0]
-    styled = df.style.format("{:.2f}", na_rep="-")
+    fmt = {}
+    if first_col in df.columns:
+        fmt[first_col] = "{:,.0f}"
+    for col in df.columns[1:]:
+        fmt[col] = "{:.2f}"
+    styled = df.style.format(fmt, na_rep="-")
     
     # Filter to apply gradient only on numeric columns from the second column onwards
     numeric_cols = [col for col in df.columns[1:] if pd.api.types.is_numeric_dtype(df[col])]
@@ -536,8 +575,6 @@ def style_heatmap(df, cmap="Greens"):
     if numeric_cols:
         styled = styled.background_gradient(axis=None, cmap=cmap, subset=numeric_cols)
 
-    if first_col in df.columns:
-        styled = styled.format({first_col: "{:,.0f}"})
     return styled
 
 def style_percent_heatmap(df, cmap="Blues"):
@@ -545,12 +582,15 @@ def style_percent_heatmap(df, cmap="Blues"):
     if df is None or df.empty:
         return df
     styled = df.style
+    fmt = {}
     if df.columns[0].lower().startswith("total"):
-        styled = styled.format({df.columns[0]: "{:,.0f}"})
+        fmt[df.columns[0]] = "{:,.0f}"
         percent_cols = df.columns[1:]
     else:
         percent_cols = df.columns
-    styled = styled.format({col: "{:.2f}%" for col in percent_cols}, na_rep="-")
+    for col in percent_cols:
+        fmt[col] = "{:.2f}%"
+    styled = styled.format(fmt, na_rep="-")
 
     # Color mapping: 0 -> rojo, >0 -> gradiente verde
     def color_map(val):
@@ -632,6 +672,63 @@ def style_frequency_velocidad(df):
         styled = styled.background_gradient(cmap=RETENTION_CMAP, subset=['% del Total'])
     return styled
 
+def style_survival_table(df):
+    """Estilos para tabla de supervivencia: % en Meses, días/pedidos/revenue en columnas finales."""
+    if df is None or df.empty:
+        return df
+    data = df.copy()
+    # Limpiar posibles strings con % o € en columnas finales
+    for col in ["Lifetime_Prom", "Pedidos_Prom", "Revenue_Prom"]:
+        if col in data.columns and data[col].dtype == object:
+            data[col] = (
+                data[col]
+                .astype(str)
+                .str.replace("%", "", regex=False)
+                .str.replace("€", "", regex=False)
+            )
+            data[col] = pd.to_numeric(data[col], errors="coerce")
+
+    cols = data.columns
+    fmt = {}
+    if len(cols):
+        if cols[0].lower().startswith("total"):
+            fmt[cols[0]] = "{:,.0f}"
+    mes_cols = [c for c in cols if str(c).startswith("Mes ")]
+    for c in mes_cols:
+        fmt[c] = "{:.2f}%"
+    if "Lifetime_Prom" in cols:
+        fmt["Lifetime_Prom"] = "{:.1f}"
+    if "Pedidos_Prom" in cols:
+        fmt["Pedidos_Prom"] = "{:.2f}"
+    if "Revenue_Prom" in cols:
+        fmt["Revenue_Prom"] = "€{:.2f}"
+
+    styled = data.style.format(fmt, na_rep="-")
+    if mes_cols:
+        scale_cols = [c for c in mes_cols if str(c) != "Mes 0"]
+        if not scale_cols:
+            scale_cols = mes_cols
+        max_val = pd.to_numeric(data[scale_cols].stack(), errors="coerce").max()
+        if pd.isna(max_val) or max_val <= 0:
+            max_val = 1.0
+
+        def color_map(val):
+            if pd.isna(val):
+                return ""
+            if val == 0:
+                return "background-color: #ff6b6b; color: white"
+            # Interpolar verde claro (#e8f5e9) a verde oscuro (#1b5e20)
+            t = max(0.0, min(1.0, float(val) / max_val))
+            start = np.array([0xE8, 0xF5, 0xE9])
+            end = np.array([0x1B, 0x5E, 0x20])
+            rgb = (start + (end - start) * t).astype(int)
+            return f"background-color: rgb({rgb[0]},{rgb[1]},{rgb[2]}); color: {'white' if t>0.55 else 'black'}"
+
+        styled = styled.applymap(color_map, subset=mes_cols)
+    if "Lifetime_Prom" in cols:
+        styled = styled.background_gradient(cmap="Greens", subset=["Lifetime_Prom"])
+    return styled
+
 def styler_supported():
     """Devuelve True si la versión de Streamlit permite renderizar pandas.Styler en st.dataframe."""
     try:
@@ -648,6 +745,110 @@ def show_table(df, styler_fn=None, info_msg=None):
         if info_msg:
             st.info(info_msg)
         st.dataframe(df)
+
+def style_delta_retention(df):
+    """Estilos para diferencias (B - A) en retención: verde positivo, rojo negativo."""
+    if df is None or df.empty:
+        return df
+    first_col = df.columns[0] if len(df.columns) else None
+    styled = df.style
+    fmt = {}
+    if first_col:
+        fmt[first_col] = "{:+,.0f}"
+        percent_cols = df.columns[1:]
+    else:
+        percent_cols = df.columns
+    for col in percent_cols:
+        fmt[col] = "{:+.2f}%"
+    styled = styled.format(fmt, na_rep="-")
+
+    def color_sign(val):
+        if pd.isna(val):
+            return ""
+        if val > 0:
+            return "background-color: #c8e6c9; color: #1b5e20"
+        if val < 0:
+            return "background-color: #ffcdd2; color: #b71c1c"
+        return "background-color: #eeeeee; color: #424242"
+
+    if first_col:
+        styled = styled.applymap(color_sign, subset=[first_col])
+    if len(percent_cols):
+        styled = styled.applymap(color_sign, subset=percent_cols)
+    return styled
+
+def style_delta_counts(df):
+    """Estilos para diferencias en conteos: verde positivo, rojo negativo."""
+    if df is None or df.empty:
+        return df
+    styled = df.style.format("{:+,.0f}", na_rep="-")
+
+    def color_sign(val):
+        if pd.isna(val):
+            return ""
+        if val > 0:
+            return "background-color: #c8e6c9; color: #1b5e20"
+        if val < 0:
+            return "background-color: #ffcdd2; color: #b71c1c"
+        return "background-color: #eeeeee; color: #424242"
+
+    styled = styled.applymap(color_sign)
+    return styled
+
+def normalize_retention_df(df):
+    """Normaliza índices/columnas y fuerza columnas numéricas en reportes de retención."""
+    if df is None or df.empty:
+        return df
+    df_norm = df.copy()
+    df_norm.index = df_norm.index.map(str)
+    df_norm.columns = df_norm.columns.map(str)
+    if len(df_norm.columns):
+        first_col = df_norm.columns[0]
+        df_norm[first_col] = pd.to_numeric(df_norm[first_col], errors="coerce")
+        for col in df_norm.columns[1:]:
+            df_norm[col] = pd.to_numeric(df_norm[col], errors="coerce")
+    return df_norm
+
+def sort_period_labels(labels, freq):
+    """Ordena etiquetas de periodos (Q/Y) de forma cronológica si es posible."""
+    def _key(x):
+        try:
+            if freq == "Q":
+                return pd.Period(str(x).replace("Y", ""), freq="Q").start_time
+            if freq == "Y":
+                return pd.Period(str(x).replace("Y", ""), freq="Y").start_time
+        except Exception:
+            return pd.Timestamp.min
+        return pd.Timestamp.min
+    return sorted(set(labels), key=_key)
+
+def align_retention_tables(df_a, df_b, freq):
+    """Alinea dos tablas de retención por índice y columnas."""
+    df_a = normalize_retention_df(df_a)
+    df_b = normalize_retention_df(df_b)
+    if df_a is None or df_b is None:
+        return df_a, df_b
+    idx = sort_period_labels(list(df_a.index) + list(df_b.index), freq=freq)
+
+    # Mantener la primera columna de totales y ordenar el resto por periodo
+    first_col = df_a.columns[0] if len(df_a.columns) else (df_b.columns[0] if len(df_b.columns) else "Total Clientes")
+    other_cols = [c for c in list(df_a.columns) + list(df_b.columns) if c != first_col]
+    other_cols = sort_period_labels(other_cols, freq=freq)
+    cols = [first_col] + [c for c in other_cols if c != first_col]
+
+    df_a = df_a.reindex(index=idx, columns=cols)
+    df_b = df_b.reindex(index=idx, columns=cols)
+    return df_a, df_b
+
+def retention_counts_from_pct(df):
+    """Calcula conteos estimados por celda (pct * total clientes)."""
+    if df is None or df.empty:
+        return df
+    df_counts = df.copy()
+    total_col = df_counts.columns[0]
+    for col in df_counts.columns[1:]:
+        df_counts[col] = (df_counts[col] / 100.0 * df_counts[total_col]).round(0)
+    return df_counts
 
 def filter_reports_by_date(reports, start_date, end_date):
     """Filtra tablas de informes solo para visualización según rango de fechas sin recalcular CSV."""
@@ -764,7 +965,7 @@ st.set_page_config(layout="wide", page_title="Análisis CLV Ecommerce")
 
 # Paletas de color más contrastadas
 RETENTION_CMAP = "RdYlGn"
-SURVIVAL_CMAP = "YlOrRd"
+SURVIVAL_CMAP = "YlGn"
 FREQ_DISTRIB_CMAP = "BuGn"
 FREQ_EVOL_CMAP = "PuBu"
 FREQ_VEL_CMAP = "OrRd"
@@ -801,7 +1002,7 @@ if st.session_state.get("nav_to"):
     st.session_state["nav_to"] = None
 mode = st.sidebar.radio(
     "¿Qué deseas hacer?",
-    ("Generar informe", "Informes guardados", "Ver informe"),
+    ("Generar informe", "Informes guardados", "Ver informe", "Comparar informes"),
     index=2 if st.session_state.get("base_reports") else 0,
     key="app_mode"
 )
@@ -837,6 +1038,19 @@ if mode == "Generar informe":
                 key="date_format_select"
             )
             st.session_state["date_format_mode"] = DATE_FORMAT_OPTIONS.get(selected_fmt, "auto")
+
+            amount_labels = {
+                "Auto (detectar)": "auto",
+                "Euros (€)": "eur",
+                "Céntimos": "cents",
+            }
+            selected_amount = st.selectbox(
+                "Unidad de Total_pagado",
+                list(amount_labels.keys()),
+                index=0,
+                key="amount_unit_select"
+            )
+            st.session_state["amount_unit_mode"] = amount_labels.get(selected_amount, "auto")
 
             fechas_preview = None
             if 'fecha' in st.session_state["df_raw"].columns:
@@ -876,7 +1090,13 @@ if mode == "Generar informe":
                 log = log_box.write
                 with st.spinner("Procesando datos y generando informes... Esto puede tardar unos minutos."):
                     date_mode = st.session_state.get("date_format_mode", "auto")
-                    df_processed = preprocess_data(st.session_state["df_raw"].copy(), logger=log, date_mode=date_mode) # Usar df_raw del session_state
+                    amount_mode = st.session_state.get("amount_unit_mode", "auto")
+                    df_processed = preprocess_data(
+                        st.session_state["df_raw"].copy(),
+                        logger=log,
+                        date_mode=date_mode,
+                        amount_mode=amount_mode
+                    ) # Usar df_raw del session_state
                     if df_processed is not None and not df_processed.empty:
                         start_ts = pd.Timestamp(date_start)
                         end_ts = pd.Timestamp(date_end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
@@ -1099,6 +1319,102 @@ elif mode == "Informes guardados":
                         st.session_state["delete_candidate"] = None
 
 
+# --- Comparación de informes guardados ---
+elif mode == "Comparar informes":
+    reports_index = load_reports_index()
+    if not reports_index or len(reports_index) < 2:
+        st.info("Necesitas al menos 2 informes guardados para comparar.")
+    else:
+        st.subheader("Comparar informes guardados")
+        sorted_reports_items = sorted(reports_index.items(), key=lambda item: item[1]['timestamp'], reverse=True)
+        report_names = [name for name, _ in sorted_reports_items]
+
+        default_a = 0
+        default_b = 1 if len(report_names) > 1 else 0
+        report_a = st.selectbox("Informe A", report_names, index=default_a, key="compare_report_a")
+        report_b = st.selectbox("Informe B", report_names, index=default_b, key="compare_report_b")
+
+        if report_a == report_b:
+            st.warning("Selecciona dos informes distintos para comparar.")
+        else:
+            data_a = reports_index.get(report_a, {})
+            data_b = reports_index.get(report_b, {})
+
+            st.markdown(
+                f"**A:** {report_a} | Guardado: {data_a.get('timestamp', '')} | Rango: {data_a.get('date_min', '')} a {data_a.get('date_max', '')}"
+            )
+            st.markdown(
+                f"**B:** {report_b} | Guardado: {data_b.get('timestamp', '')} | Rango: {data_b.get('date_min', '')} a {data_b.get('date_max', '')}"
+            )
+            st.caption("Diferencias calculadas como: B − A (puntos porcentuales en retención).")
+
+            def load_saved_report(report_data):
+                report_filepath = os.path.join(REPORTS_DIR, report_data.get("filename", ""))
+                if not os.path.exists(report_filepath):
+                    return None
+                all_reports = pd.read_excel(report_filepath, sheet_name=None, index_col=0)
+                return {
+                    "report1": all_reports.get('Retención Trimestral'),
+                    "report2": all_reports.get('Retención Anual'),
+                }
+
+            reports_a = load_saved_report(data_a)
+            reports_b = load_saved_report(data_b)
+
+            if reports_a is None:
+                st.error(f"No se pudo leer el archivo del informe A: {data_a.get('filename', '')}")
+            if reports_b is None:
+                st.error(f"No se pudo leer el archivo del informe B: {data_b.get('filename', '')}")
+
+            if reports_a is not None and reports_b is not None:
+                # --- Retención anual ---
+                annual_a, annual_b = align_retention_tables(reports_a.get("report2"), reports_b.get("report2"), freq="Y")
+                annual_delta = None
+                if annual_a is not None and annual_b is not None:
+                    annual_delta = annual_b - annual_a
+
+                st.markdown("### Retención anual por cohortes")
+                if annual_a is None or annual_b is None:
+                    st.warning("No se encontró el informe anual en uno de los archivos seleccionados.")
+                else:
+                    tabs_annual = st.tabs(["Informe A", "Informe B", "Diferencias"])
+                    with tabs_annual[0]:
+                        show_table(annual_a, style_percent_heatmap, info_msg="Vista sin estilo por compatibilidad.")
+                    with tabs_annual[1]:
+                        show_table(annual_b, style_percent_heatmap, info_msg="Vista sin estilo por compatibilidad.")
+                    with tabs_annual[2]:
+                        show_table(annual_delta, style_delta_retention, info_msg="Vista sin estilo por compatibilidad.")
+
+                    with st.expander("Detalle anual (conteos estimados por cohorte)"):
+                        counts_a = retention_counts_from_pct(annual_a)
+                        counts_b = retention_counts_from_pct(annual_b)
+                        counts_delta = counts_b - counts_a
+                        tabs_counts = st.tabs(["Informe A", "Informe B", "Diferencias"])
+                        with tabs_counts[0]:
+                            show_table(counts_a, lambda d: style_heatmap(d, cmap="Blues"), info_msg="Vista sin estilo por compatibilidad.")
+                        with tabs_counts[1]:
+                            show_table(counts_b, lambda d: style_heatmap(d, cmap="Blues"), info_msg="Vista sin estilo por compatibilidad.")
+                        with tabs_counts[2]:
+                            show_table(counts_delta, style_delta_counts, info_msg="Vista sin estilo por compatibilidad.")
+
+                # --- Retención trimestral ---
+                quarterly_a, quarterly_b = align_retention_tables(reports_a.get("report1"), reports_b.get("report1"), freq="Q")
+                quarterly_delta = None
+                if quarterly_a is not None and quarterly_b is not None:
+                    quarterly_delta = quarterly_b - quarterly_a
+
+                st.markdown("### Retención trimestral por cohortes")
+                if quarterly_a is None or quarterly_b is None:
+                    st.warning("No se encontró el informe trimestral en uno de los archivos seleccionados.")
+                else:
+                    tabs_quarter = st.tabs(["Informe A", "Informe B", "Diferencias"])
+                    with tabs_quarter[0]:
+                        show_table(quarterly_a, style_retention_table, info_msg="Vista sin estilo por compatibilidad.")
+                    with tabs_quarter[1]:
+                        show_table(quarterly_b, style_retention_table, info_msg="Vista sin estilo por compatibilidad.")
+                    with tabs_quarter[2]:
+                        show_table(quarterly_delta, style_delta_retention, info_msg="Vista sin estilo por compatibilidad.")
+
 # --- Visualización de los informes (solo en modo "Ver informe") ---
 if mode == "Ver informe":
     base_reports = st.session_state.get("base_reports")
@@ -1109,12 +1425,27 @@ if mode == "Ver informe":
         st.markdown(f"## Informe: {st.session_state.get('selected_report', 'Recién Generado')}")
         data_min = st.session_state.get("data_date_min")
         data_max = st.session_state.get("data_date_max")
-        if not data_min or not data_max:
+        if not data_min or not data_max or (data_min and data_max and data_min > data_max):
             today = datetime.now().date()
             data_min = today - timedelta(days=365)
             data_max = today
-        if "view_date_range" not in st.session_state:
-            st.session_state["view_date_range"] = (data_min, data_max)
+        view_range_value = st.session_state.get("view_date_range", (data_min, data_max))
+        if not isinstance(view_range_value, (list, tuple)) or len(view_range_value) != 2:
+            view_range_value = (data_min, data_max)
+        view_start, view_end = view_range_value
+        if isinstance(view_start, datetime):
+            view_start = view_start.date()
+        if isinstance(view_end, datetime):
+            view_end = view_end.date()
+        if not view_start or not view_end:
+            view_start, view_end = data_min, data_max
+        if view_start < data_min:
+            view_start = data_min
+        if view_end > data_max:
+            view_end = data_max
+        if view_start > view_end:
+            view_start, view_end = data_min, data_max
+        st.session_state["view_date_range"] = (view_start, view_end)
 
         with st.sidebar.expander("Filtrar visualización por fechas", expanded=False):
             view_range = st.date_input(
@@ -1247,7 +1578,7 @@ if mode == "Ver informe":
                 st.subheader("Tabla de Supervivencia por Cohorte")
                 show_table(
                     display_reports['report3'],
-                    styler_fn=lambda d: style_percent_heatmap(d, cmap=SURVIVAL_CMAP),
+                    styler_fn=style_survival_table,
                     info_msg="Tu versión de Streamlit no soporta estilos de pandas (<1.31). Se muestra la tabla sin colores."
                 )
 
