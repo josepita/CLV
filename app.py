@@ -140,7 +140,30 @@ def verify_user(username: str, password: str, users: dict) -> bool:
 def require_auth():
     users = load_users_config()
     if not users:
-        st.error("No hay usuarios configurados. Configura `st.secrets['users']` o un archivo `users.json`.")
+        diagnostics = []
+        env_b64 = os.getenv("CLV_USERS_B64")
+        env_json = os.getenv("CLV_USERS_JSON")
+        if env_b64:
+            try:
+                decoded = base64.b64decode(env_b64).decode("utf-8")
+                json.loads(decoded)
+                diagnostics.append("CLV_USERS_B64 presente y válido.")
+            except Exception:
+                diagnostics.append("CLV_USERS_B64 presente pero inválido (base64 o JSON).")
+        if env_json:
+            try:
+                json.loads(env_json)
+                diagnostics.append("CLV_USERS_JSON presente y válido.")
+            except Exception:
+                diagnostics.append("CLV_USERS_JSON presente pero inválido (JSON).")
+
+        st.error(
+            "No hay usuarios configurados. Configura `CLV_USERS_JSON` o `CLV_USERS_B64`, "
+            "`st.secrets['users']` o un archivo `users.json`."
+        )
+        if diagnostics:
+            for d in diagnostics:
+                st.warning(d)
         st.markdown("Ejemplo de `users.json`:")
         st.code('{\n  \"users\": {\n    \"admin\": {\"salt\": \"SALT\", \"hash\": \"SHA256\"}\n  }\n}', language="json")
         st.stop()
