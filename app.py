@@ -9,6 +9,7 @@ import re
 import hashlib
 import base64
 
+#
 # --- Configuración de persistencia de informes ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
